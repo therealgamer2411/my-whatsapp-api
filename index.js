@@ -499,17 +499,60 @@ app.post('/send', adminOnly, async (req, res) => {
   }
 });
 
+async function runAiStartupDiagnostics() {
+  if (String(process.env.AI_STARTUP_DIAGNOSTICS || 'false').toLowerCase() !== 'true') return;
+  if (!process.env.GEMINI_API_KEY) {
+    console.error('[AI Diagnostics] SKIPPED: Gemini API key is missing.');
+    return;
+  }
+
+  const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+  try {
+    const { GoogleGenAI } = await import('@google/genai');
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    const response = await ai.models.generateContent({
+      model,
+      contents: 'Reply with exactly: OK',
+      config: { temperature: 0, maxOutputTokens: 8 }
+    });
+    if (!String(response.text || '').trim()) throw new Error('Gemini returned an empty response.');
+    console.log('[AI Diagnostics] TEXT_OK model=' + model);
+  } catch (error) {
+    console.error('[AI Diagnostics] TEXT_FAILED model=' + model + ' error=' + String(error.message || error).slice(0, 500));
+    return;
+  }
+
+  try {
+    const audio = await synthesizeVoiceNote('ده اختبار صوتي قصير للسكرتير الذكي.');
+    console.log('[AI Diagnostics] TTS_OK bytes=' + audio.length);
+  } catch (error) {
+    console.error('[AI Diagnostics] TTS_FAILED error=' + String(error.message || error).slice(0, 500));
+  }
+}
+
 app.listen(PORT, HOST, () => {
   console.log('[HTTP] Admin API: http://' + HOST + ':' + PORT);
   if (!ADMIN_TOKEN) console.warn('[Security] ADMIN_TOKEN missing; admin routes disabled.');
   if (!process.env.GEMINI_API_KEY) console.warn('[AI] GEMINI_API_KEY missing; only a fallback response is available.');
+  else console.log('[AI] Gemini key loaded from the runtime environment.');
   if (!normalizePhone(process.env.MANAGER_PHONE || '')) console.warn('[Handoff] MANAGER_PHONE missing; configure it before live use.');
+  else console.log('[Handoff] Manager contact configured: ' + MANAGER_NAME + ' (' + process.env.MANAGER_PHONE.slice(-4) + ').');
   if (!autoReply) console.log('[Secretary] AUTO_REPLY_ENABLED=false; no automatic replies will be sent.');
-});
 
-client.initialize().catch((error) => {
-  ready = false;
-  console.error('[WhatsApp] Initialization failed:', error.message);
+  runAiStartupDiagnostics().catch((error) => {
+    console.error('[AI Diagnostics] Unexpected test failure:', error.message);
+  });
+
+  // Railway may briefly overlap two deployments while switching traffic. Wait for the old
+  // Chromium process to release the shared LocalAuth profile before launching the new one.
+  const browserStartDelay = Math.max(10000, Number(process.env.WHATSAPP_START_DELAY_MS || 15000));
+  console.log('[WhatsApp] Browser initialization scheduled in ' + browserStartDelay + 'ms.');
+  setTimeout(() => {
+    client.initialize().catch((error) => {
+      ready = false;
+      console.error('[WhatsApp] Initialization failed:', error.message);
+    });
+  }, browserStartDelay);
 });
 
 process.on('SIGINT', () => {
