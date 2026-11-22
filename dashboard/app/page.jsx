@@ -308,7 +308,7 @@ export default function Home() {
 
   const activePage = NAV.find((item) => item.id === page)?.label || "الرئيسية";
   const isConnected = health?.whatsapp === "ready";
-  const connectionLabel = isConnected ? "متصل" : serviceStarting ? "جارٍ التشغيل" : serviceEnabled ? "يعمل - بانتظار الربط" : "متوقف";
+  const connectionLabel = isConnected ? "متصل" : health?.whatsappLastError ? "فشل التشغيل" : serviceStarting ? "جارٍ التشغيل" : serviceEnabled ? "يعمل - بانتظار الربط" : "متوقف";
 
   return (
     <main className="app-shell">
@@ -410,6 +410,7 @@ export default function Home() {
               <span className={"status-pill " + (isConnected ? "online" : "offline")}><i />{connectionLabel}</span>
             </div>
             <p className="panel-description">اربط رقمك الحالي كجهاز مرتبط. ستظل تستخدم تطبيق واتساب على هاتفك كالمعتاد.</p>
+            {health?.whatsappLastError && <p className="notice error" role="alert">تعذر تشغيل واتساب: {health.whatsappLastError}</p>}
             <Field label="رابط محرك واتساب" hint="عنوان HTTPS للخادم الذي يشغّل محرك WhatsApp Web، وليس رابط لوحة Vercel.">
               <input className="text-input" dir="ltr" placeholder="https://your-worker.example.com" value={workerUrl} onChange={(e) => setWorkerUrl(e.target.value)} />
             </Field>
