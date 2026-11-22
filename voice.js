@@ -48,7 +48,7 @@ async function transcribeAudio(media) {
   const mimeType = normalizeAudioMimeType(media.mimetype || media.mimeType);
   const ai = await getAi();
   const interaction = await ai.interactions.create({
-    model: process.env.GEMINI_AUDIO_MODEL || 'gemini-3.6-flash',
+    model: process.env.GEMINI_AUDIO_MODEL || 'gemini-3.5-transcribe',
     input: [
       {
         type: 'text',
