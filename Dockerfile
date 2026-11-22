@@ -60,4 +60,4 @@ EXPOSE 3000
 
 USER root
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["sh", "-c", "mkdir -p /app/persist/data /app/persist/.wwebjs_auth && chown -R node:node /app/persist && exec gosu node node index.js"]
+CMD ["sh", "-c", "mkdir -p /app/persist/data /app/persist/.wwebjs_auth/session-mohamed-secretary && rm -f /app/persist/.wwebjs_auth/session-mohamed-secretary/SingletonLock /app/persist/.wwebjs_auth/session-mohamed-secretary/SingletonCookie /app/persist/.wwebjs_auth/session-mohamed-secretary/SingletonSocket && chown -R node:node /app/persist && exec gosu node node index.js"]
