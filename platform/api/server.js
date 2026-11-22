@@ -253,7 +253,14 @@ async function resolveSecretary(session,contact,settings,history) {
     [session.workspace_id]
   )).rows;
   if (!candidates.length) throw new Error('No active secretary profile exists.');
-  const route=await classifySecretary(settings,candidates,history);
+  let route;
+  try {
+    route=await classifySecretary(settings,candidates,history);
+  } catch(e) {
+    const fallback=candidates.find(s=>s.is_default)||candidates[0];
+    route={secretary:fallback,source:'auto',category:'general',confidence:0,reason:'تعذر التصنيف مؤقتًا؛ تم تحويل المحادثة إلى السكرتير العام.'};
+    console.warn('[Secretary classifier fallback]',e.message);
+  }
   await pool.query(
     'UPDATE contacts SET secretary_id=$1,secretary_assignment=$2,secretary_category=$3,secretary_confidence=$4,secretary_reason=$5 WHERE id=$6',
     [route.secretary.id,route.source,route.category,route.confidence,route.reason,contact.id]
