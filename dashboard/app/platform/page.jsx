@@ -33,6 +33,11 @@ export default function PlatformPage() {
     apiKey: "",
     has_api_key: false
   });
+  const [campaigns, setCampaigns] = useState([]);
+  const [campaignTitle, setCampaignTitle] = useState("");
+  const [campaignBody, setCampaignBody] = useState("");
+  const [campaignDelay, setCampaignDelay] = useState(10000);
+  const [campaignConfirmed, setCampaignConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -154,6 +159,20 @@ export default function PlatformPage() {
     }).catch((e) => flash(e.message, true));
   }, [token, view, request]);
 
+  useEffect(() => {
+    if (!token || view !== "campaigns") return;
+    let active = true;
+    const load = async () => {
+      try {
+        const [c, contacts] = await Promise.all([request("/v1/campaigns"), request("/v1/conversations")]);
+        if (active) { setCampaigns(c.campaigns || []); setConversations(contacts.conversations || []); }
+      } catch (e) { if (active) flash(e.message, true); }
+    };
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [token, view, request]);
+
   async function authenticate(event) {
     event.preventDefault();
     setBusy(true);
@@ -198,6 +217,53 @@ export default function PlatformPage() {
       flash("تم إنشاء جلسة واتساب. جارٍ تجهيز QR.");
     } catch (e) { flash(e.message, true); }
     finally { setBusy(false); }
+  }
+
+  async function deleteSession(session) {
+    if (!window.confirm("حذف رقم " + session.label + "؟ سيتم تسجيل خروجه وحذف محادثاته وسجل رسائله من مساحة العمل.")) return;
+    setBusy(true);
+    try {
+      await request("/v1/whatsapp/sessions/" + session.id, { method: "DELETE" });
+      if (selectedSession === session.id) { setSelectedSession(""); setQr(""); setSessionStatus(""); }
+      await loadOverview();
+      flash("تم حذف حساب واتساب.");
+    } catch (e) { flash(e.message, true); }
+    finally { setBusy(false); }
+  }
+
+  async function setMarketingConsent(contact, enabled) {
+    try {
+      await request("/v1/contacts/" + contact.id + "/marketing-consent", {
+        method: "PATCH", body: JSON.stringify({ enabled, source: enabled ? "confirmed-in-dashboard" : "" })
+      });
+      setConversations(old => old.map(c => c.id === contact.id ? { ...c, marketing_opt_in: enabled } : c));
+      flash(enabled ? "تم تسجيل موافقة جهة الاتصال." : "تم سحب الموافقة.");
+    } catch (e) { flash(e.message, true); }
+  }
+
+  async function createCampaign(event) {
+    event.preventDefault();
+    const selected = conversations.filter(c => c.marketing_opt_in && ["WORKING","CONNECTED"].includes(String(c.session_status).toUpperCase())).map(c => c.id);
+    if (!selected.length) { flash("لا توجد جهات اتصال لديها موافقة مسجلة ورقم متصل.", true); return; }
+    setBusy(true);
+    try {
+      await request("/v1/campaigns", { method: "POST", body: JSON.stringify({
+        title: campaignTitle, body: campaignBody, delayMs: Number(campaignDelay),
+        contactIds: selected, confirmOptIn: campaignConfirmed
+      })});
+      setCampaignTitle(""); setCampaignBody(""); setCampaignConfirmed(false);
+      const data = await request("/v1/campaigns"); setCampaigns(data.campaigns || []);
+      flash("تم إنشاء الحملة. بدأ الإرسال وفق قائمة الموافقات المسجلة.");
+    } catch (e) { flash(e.message, true); }
+    finally { setBusy(false); }
+  }
+
+  async function campaignAction(id, action) {
+    try {
+      await request("/v1/campaigns/" + id + "/" + action, { method: "POST", body: "{}" });
+      const data = await request("/v1/campaigns"); setCampaigns(data.campaigns || []);
+      flash("تم تحديث حالة الحملة.");
+    } catch (e) { flash(e.message, true); }
   }
 
   async function sendMessage(event) {
@@ -280,7 +346,8 @@ export default function PlatformPage() {
     ["overview", "نظرة عامة", "⌂"],
     ["whatsapp", "حسابات واتساب", "◉"],
     ["inbox", "صندوق المحادثات", "▤"],
-    ["assistant", "المساعد الذكي", "✧"]
+    ["assistant", "المساعد الذكي", "✧"],
+    ["campaigns", "الحملات الجماعية", "▣"]
   ];
 
   return (
@@ -332,9 +399,12 @@ export default function PlatformPage() {
             <form className="inline-create" onSubmit={createSession}><input value={sessionLabel} onChange={(e) => setSessionLabel(e.target.value)} placeholder="اسم الرقم / الفرع"/><button className="mf-primary" disabled={busy}>إضافة رقم +</button></form>
             <div className="session-list">
               {sessions.length === 0 && <div className="empty-state">لم تتم إضافة أي رقم بعد. أنشئ أول جلسة لبدء الربط.</div>}
-              {sessions.map((s) => <button key={s.id} className={"session-row " + (selectedSession === s.id ? "chosen" : "")} onClick={() => { setSelectedSession(s.id); setQr(""); }}>
-                <div className="whatsapp-icon">◉</div><div className="session-info"><b>{s.label}</b><small dir="ltr">{s.phone_number || s.engine || "بانتظار الربط"}</small></div><span className={"mini-status " + (["WORKING","CONNECTED"].includes(s.status) ? "ok" : "")}>{s.status}</span>
-              </button>)}
+              {sessions.map((s) => <div key={s.id} className="session-entry">
+                <button className={"session-row " + (selectedSession === s.id ? "chosen" : "")} onClick={() => { setSelectedSession(s.id); setQr(""); }}>
+                  <div className="whatsapp-icon">◉</div><div className="session-info"><b>{s.label}</b><small dir="ltr">{s.phone_number || s.engine || "بانتظار الربط"}</small></div><span className={"mini-status " + (["WORKING","CONNECTED"].includes(s.status) ? "ok" : "")}>{s.status}</span>
+                </button>
+                <button className="session-delete" disabled={busy} onClick={() => deleteSession(s)} title="حذف الحساب">حذف</button>
+              </div>)}
             </div>
           </section>
           <section className="panel pairing-panel">
@@ -367,7 +437,39 @@ export default function PlatformPage() {
           </section>
         </div>}
 
-        {view === "assistant" && <div className="mf-content">
+
+        {view === "campaigns" && <div className="mf-content">
+          <section className="panel campaign-panel">
+            <div className="panel-head"><div><span className="eyebrow">CONSENT-BASED OUTREACH</span><h3>إنشاء حملة رسائل موحدة</h3></div><span className="count-badge">{conversations.filter(c => c.marketing_opt_in).length} موافق</span></div>
+            <p className="muted">تُرسل الرسالة نفسها فقط لجهات الاتصال التي سجلت موافقتها. الإرسال متدرج، ويمكن إيقاف الحملة. أي خطأ من مزود واتساب يوقف الحملة تلقائيًا.</p>
+            <form className="mf-form" onSubmit={createCampaign}>
+              <label>اسم الحملة<input required value={campaignTitle} onChange={e=>setCampaignTitle(e.target.value)} placeholder="مثال: عرض نهاية الشهر"/></label>
+              <label>نص الرسالة<textarea required rows={4} maxLength={4000} value={campaignBody} onChange={e=>setCampaignBody(e.target.value)} placeholder="اكتب الرسالة الموحدة هنا"/></label>
+              <label>الفاصل التشغيلي بين الرسائل<select value={campaignDelay} onChange={e=>setCampaignDelay(Number(e.target.value))}><option value={10000}>10 ثوانٍ</option><option value={15000}>15 ثانية</option><option value={30000}>30 ثانية</option><option value={60000}>60 ثانية</option></select></label>
+              <label className="consent-confirm"><input type="checkbox" checked={campaignConfirmed} onChange={e=>setCampaignConfirmed(e.target.checked)}/> أؤكد أن كل المستلمين وافقوا صراحةً على استقبال رسائل من هذا النشاط، وأن الرسالة متوافقة مع تفضيلاتهم.</label>
+              <button className="mf-primary" disabled={busy || !campaignConfirmed}>إنشاء الحملة وإرسالها إلى {conversations.filter(c => c.marketing_opt_in && ["WORKING","CONNECTED"].includes(String(c.session_status).toUpperCase())).length} جهة مؤهلة</button>
+            </form>
+          </section>
+          <section className="panel campaign-panel">
+            <div className="panel-head"><div><span className="eyebrow">CONTACT PERMISSIONS</span><h3>إدارة موافقات جهات الاتصال</h3></div></div>
+            <div className="consent-list">
+              {conversations.map(c=><div className="consent-row" key={c.id}>
+                <div><b>{c.display_name}</b><small dir="ltr">{c.phone_number}</small></div>
+                <label><input type="checkbox" checked={Boolean(c.marketing_opt_in)} onChange={e=>setMarketingConsent(c,e.target.checked)}/> موافق على الرسائل</label>
+              </div>)}
+              {!conversations.length && <div className="empty-state">لا توجد جهات اتصال بعد.</div>}
+            </div>
+          </section>
+          <section className="panel campaign-panel">
+            <div className="panel-head"><div><span className="eyebrow">CAMPAIGN HISTORY</span><h3>سجل الحملات</h3></div></div>
+            <div className="campaign-list">{campaigns.map(c=><div className="campaign-row" key={c.id}>
+              <div><b>{c.title}</b><small>{c.status} · {c.sent_count}/{c.total_count} تم الإرسال · {c.failed_count} أخطاء</small></div>
+              <div className="campaign-actions">{c.status==="running"||c.status==="queued"? <button onClick={()=>campaignAction(c.id,"pause")}>إيقاف مؤقت</button>:null}{c.status==="paused"? <button onClick={()=>campaignAction(c.id,"resume")}>استئناف</button>:null}{["running","queued","paused"].includes(c.status)?<button onClick={()=>campaignAction(c.id,"cancel")}>إلغاء</button>:null}</div>
+            </div>)}</div>
+          </section>
+          <div className="hint-panel"><span>ⓘ</span><p>الفواصل الزمنية هنا لتنظيم الحملات والتحكم في الحمل على الخادم، وليست وسيلة لتجاوز قيود واتساب أو ضمان عدم الحظر. أوقف الإرسال عند ظهور قيود أو شكاوى، واحترم طلبات إلغاء الاشتراك.</p></div>
+        </div>}
+\n        {view === "assistant" && <div className="mf-content">
           <section className="panel assistant-panel">
             <div className="panel-head"><div><span className="eyebrow">AI CONFIGURATION</span><h3>إعدادات المساعد الذكي</h3></div><span className={assistant.enabled ? "state-pill" : "state-pill muted-state"}>{assistant.enabled ? "مفعّل" : "متوقف"}</span></div>
             <p className="muted">اختر محرك ذكاء اصطناعي يمكن استضافته ذاتيًا مثل Ollama أو vLLM عبر واجهة OpenAI-compatible، أو اربط مزودًا خارجيًا. مفتاح كل مساحة عمل يُخزّن مشفرًا.</p>
