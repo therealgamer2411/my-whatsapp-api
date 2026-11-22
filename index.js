@@ -26,6 +26,8 @@ let ready = false;
 let latestQr = null;
 let whatsappServiceEnabled = true;
 let whatsappInitializing = false;
+let whatsappLastError = null;
+let whatsappOperationId = 0;
 const queues = new Map();
 const botOutbox = new Map();
 
@@ -223,7 +225,8 @@ async function processMessage(message) {
   addMessage(chatId, 'assistant', answer);
 }
 
-const client = new Client({
+function createWhatsAppClient() {
+  const instance = new Client({
   authStrategy: new LocalAuth({
     clientId: 'mohamed-secretary',
     dataPath: process.env.WWEBJS_AUTH_PATH || './.wwebjs_auth'
@@ -247,37 +250,37 @@ const client = new Client({
   takeoverOnConflict: false
 });
 
-client.on('qr', (qr) => {
+  instance.on('qr', (qr) => {
   latestQr = qr;
   console.log('\nامسح QR من واتساب: الأجهزة المرتبطة ← ربط جهاز');
   qrcode.generate(qr, { small: true });
 });
-client.on('loading_screen', (percent, message) => {
+  instance.on('loading_screen', (percent, message) => {
   console.log('[WhatsApp] Loading ' + percent + '% ' + String(message || ''));
 });
-client.on('change_state', (state) => {
+  instance.on('change_state', (state) => {
   console.log('[WhatsApp] State changed: ' + String(state));
 });
-client.on('inject_error', (error) => {
+  instance.on('inject_error', (error) => {
   console.error('[WhatsApp] Injection error:', error && (error.stack || error.message) || String(error));
 });
-client.on('authenticated', () => console.log('[WhatsApp] Authentication successful.'));
-client.on('ready', () => {
+  instance.on('authenticated', () => console.log('[WhatsApp] Authentication successful.'));
+  instance.on('ready', () => {
   latestQr = null;
   ready = true;
   console.log('[WhatsApp] Connected and ready.');
   console.log('[Secretary] Auto replies: ' + (autoReply ? 'ON' : 'OFF'));
 });
-client.on('auth_failure', (message) => {
+  instance.on('auth_failure', (message) => {
   ready = false;
   console.error('[WhatsApp] Authentication failure:', message);
 });
-client.on('disconnected', (reason) => {
+  instance.on('disconnected', (reason) => {
   ready = false;
   console.warn('[WhatsApp] Disconnected:', reason);
 });
 
-client.on('message', (message) => {
+  instance.on('message', (message) => {
   const chatId = message && message.from;
   if (!chatId) return;
   enqueue(chatId, () => processMessage(message)).catch((error) => {
@@ -287,7 +290,7 @@ client.on('message', (message) => {
 
 // If Mohamed sends a manual reply from his phone, pause that conversation.
 // Bot-generated messages are fingerprinted so they do not trigger this pause.
-client.on('message_create', (message) => {
+  instance.on('message_create', (message) => {
   if (!message || !message.fromMe || !message.to) return;
   const chatId = message.to;
   if (String(chatId).endsWith('@g.us')) return;
@@ -309,28 +312,51 @@ client.on('message_create', (message) => {
   console.log('[Secretary] Manual reply detected; paused chat ' + chatId);
 });
 
+  return instance;
+}
+
+let client = createWhatsAppClient();
+
 function startWhatsApp() {
   if (whatsappServiceEnabled && (ready || whatsappInitializing)) return;
+  const operationId = ++whatsappOperationId;
   whatsappServiceEnabled = true;
   whatsappInitializing = true;
+  whatsappLastError = null;
   latestQr = null;
   console.log('[WhatsApp] Start requested from dashboard.');
   setTimeout(() => {
-    if (!whatsappServiceEnabled) { whatsappInitializing = false; return; }
-    client.initialize().catch((error) => {
-      ready = false;
-      console.error('[WhatsApp] Initialization failed:', error.message);
-    }).finally(() => { whatsappInitializing = false; });
+    if (!whatsappServiceEnabled || operationId !== whatsappOperationId) return;
+    try {
+      if (!client) client = createWhatsAppClient();
+      client.initialize().catch((error) => {
+        if (operationId !== whatsappOperationId) return;
+        ready = false;
+        whatsappInitializing = false;
+        whatsappLastError = error.message || 'Initialization failed';
+        console.error('[WhatsApp] Initialization failed:', whatsappLastError);
+      }).then(() => {
+        if (operationId === whatsappOperationId && ready) whatsappInitializing = false;
+      });
+    } catch (error) {
+      whatsappInitializing = false;
+      whatsappLastError = error.message || 'Initialization failed';
+      console.error('[WhatsApp] Start failed:', whatsappLastError);
+    }
   }, 250);
 }
 
 async function stopWhatsApp() {
+  ++whatsappOperationId;
   whatsappServiceEnabled = false;
   whatsappInitializing = false;
   ready = false;
   latestQr = null;
+  whatsappLastError = null;
   console.log('[WhatsApp] Stop requested from dashboard.');
-  try { await client.destroy(); }
+  const oldClient = client;
+  client = null;
+  try { if (oldClient) await oldClient.destroy(); }
   catch (error) { console.warn('[WhatsApp] Stop cleanup:', error.message); }
 }
 
@@ -362,6 +388,7 @@ app.get('/health', (req, res) => {
     whatsapp: ready ? 'ready' : 'disconnected',
     whatsappServiceEnabled,
     whatsappInitializing,
+    whatsappLastError,
     aiConfigured: Boolean(process.env.GEMINI_API_KEY),
     managerConfigured: Boolean(normalizePhone(process.env.MANAGER_PHONE || '')),
     automaticReplies: autoReply,
@@ -402,6 +429,7 @@ app.get('/admin/leads', adminOnly, (req, res) => {
 });
 
 app.get('/admin/qr', adminOnly, async (req, res) => {
+  if (!whatsappServiceEnabled) return res.status(409).json({ connected: false, qr: null, waiting: false, error: 'WhatsApp service is stopped.' });
   if (ready) return res.json({ connected: true, qr: null });
   if (!latestQr) return res.status(202).json({ connected: false, qr: null, waiting: true });
   try {
@@ -615,10 +643,13 @@ app.listen(PORT, HOST, () => {
   setTimeout(() => {
     if (!whatsappServiceEnabled) return;
     whatsappInitializing = true;
+    whatsappLastError = null;
     client.initialize().catch((error) => {
       ready = false;
-      console.error('[WhatsApp] Initialization failed:', error.message);
-    }).finally(() => { whatsappInitializing = false; });
+      whatsappInitializing = false;
+      whatsappLastError = error.message || 'Initialization failed';
+      console.error('[WhatsApp] Initialization failed:', whatsappLastError);
+    }).then(() => { if (ready) whatsappInitializing = false; });
   }, browserStartDelay);
 });
 
