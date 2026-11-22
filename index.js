@@ -252,6 +252,8 @@ function createWhatsAppClient() {
 
   instance.on('qr', (qr) => {
   latestQr = qr;
+  whatsappInitializing = false;
+  whatsappLastError = null;
   console.log('\nامسح QR من واتساب: الأجهزة المرتبطة ← ربط جهاز');
   qrcode.generate(qr, { small: true });
 });
@@ -273,10 +275,13 @@ function createWhatsAppClient() {
 });
   instance.on('auth_failure', (message) => {
   ready = false;
+  whatsappInitializing = false;
+  whatsappLastError = String(message || 'Authentication failure');
   console.error('[WhatsApp] Authentication failure:', message);
 });
   instance.on('disconnected', (reason) => {
   ready = false;
+  whatsappInitializing = false;
   console.warn('[WhatsApp] Disconnected:', reason);
 });
 
@@ -656,5 +661,6 @@ app.listen(PORT, HOST, () => {
 process.on('SIGINT', () => {
   console.log('\n[Shutdown] Saving local state...');
   flush();
-  client.destroy().catch(() => {}).finally(() => process.exit(0));
+  if (client) client.destroy().catch(() => {}).finally(() => process.exit(0));
+  else process.exit(0);
 });
