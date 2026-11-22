@@ -280,43 +280,144 @@ function whatsappText(value) {
     .replace(/\x60([^\x60]+)\x60/g,'$1')
     .trim();
 }
-async function transcribeVoiceMessage(session,payload) {
-  const media=payload.media || {};
-  const mime=String(media.mimetype || '').toLowerCase().split(';')[0];
-  if (!mime.startsWith('audio/')) return '';
-  if (!media.url) throw new Error('Voice message arrived without media.url; check WAHA media-download configuration.');
+function isVoiceMessage(payload) {
+  const type=String(payload?.type || '').toLowerCase();
+  const mime=String(payload?.media?.mimetype || payload?.mimetype || '').toLowerCase();
+  return mime.startsWith('audio/') || ['ptt','audio','voice','voice_note','voicenote'].includes(type);
+}
+function wahaMediaPath(value) {
+  if (!value) return '';
+  let pathname='';
+  try {
+    const parsed=new URL(String(value));
+    pathname=parsed.pathname+parsed.search;
+  } catch {
+    pathname=String(value).startsWith('/')?String(value):'/'+String(value);
+  }
+  if (!pathname.startsWith('/api/files/') || pathname.includes('/../')) return '';
+  return pathname;
+}
+async function resolveVoiceMedia(session,payload,chatId) {
+  let source=payload||{}, media=source.media||{};
+  // Some WAHA event payloads contain hasMedia/mimetype but no downloaded URL.
+  // Re-fetch that exact message with downloadMedia=true instead of dropping it.
+  if ((!media.url || media.error) && source.id && chatId) {
+    const messageId=typeof source.id==='string'?source.id:(source.id?._serialized || source.id?.id || '');
+    if (messageId) {
+      try {
+        const route='/api/'+encodeURIComponent(session.waha_name)+'/chats/'+encodeURIComponent(chatId)+'/messages/'+encodeURIComponent(messageId)+'?downloadMedia=true&downloadMediaMimetypes=audio';
+        const hydrated=await waha('GET',route);
+        if (hydrated && typeof hydrated==='object') {
+          source=hydrated;
+          media=hydrated.media || media;
+        }
+      } catch(e) {
+        console.warn('[Voice media hydration failed]',e.message);
+      }
+    }
+  }
+  const mimeRaw=String(media.mimetype || source.mimetype || 'audio/ogg').toLowerCase().split(';')[0];
+  const mime=mimeRaw==='audio/opus'?'audio/ogg':(mimeRaw.startsWith('audio/')?mimeRaw:'audio/ogg');
+  const mediaPath=wahaMediaPath(media.url || source.mediaUrl || '');
+  if (!mediaPath) throw new Error(String(media.error || 'WAHA did not provide a downloadable audio URL.'));
   const base=String(process.env.WAHA_URL || '').replace(/\/+$/,'');
-  let path;
-  try { const u=new URL(media.url); path=u.pathname+u.search; }
-  catch { path=String(media.url).startsWith('/')?String(media.url):'/'+String(media.url); }
-  const fileResponse=await fetch(base+path,{headers:{'X-Api-Key':process.env.WAHA_API_KEY},signal:AbortSignal.timeout(30000)});
-  if (!fileResponse.ok) throw new Error('Could not download voice media from WAHA: HTTP '+fileResponse.status);
-  const bytes=Buffer.from(await fileResponse.arrayBuffer());
-  if (!bytes.length || bytes.length>20*1024*1024) throw new Error('Voice media is empty or exceeds the 20 MB processing limit.');
+  if (!base) throw new Error('WhatsApp gateway is not configured.');
+  let lastError='Media download failed.';
+  for (let attempt=1;attempt<=3;attempt++) {
+    try {
+      const response=await fetch(base+mediaPath,{
+        headers:{'X-Api-Key':process.env.WAHA_API_KEY},
+        signal:AbortSignal.timeout(60000)
+      });
+      if (!response.ok) {
+        lastError='WAHA media HTTP '+response.status;
+        if (attempt<3) { await new Promise(resolve=>setTimeout(resolve,attempt*1200)); continue; }
+        throw new Error(lastError);
+      }
+      const bytes=Buffer.from(await response.arrayBuffer());
+      if (!bytes.length) throw new Error('Downloaded voice message is empty.');
+      if (bytes.length>20*1024*1024) throw new Error('Voice message exceeds the 20 MB inline transcription limit.');
+      return {bytes,mime,mediaPath};
+    } catch(e) {
+      lastError=e.message;
+      if (attempt===3) throw new Error('Could not download voice media: '+lastError);
+      await new Promise(resolve=>setTimeout(resolve,attempt*1200));
+    }
+  }
+  throw new Error(lastError);
+}
+async function transcribeVoiceMessage(session,payload,chatId) {
+  const media=await resolveVoiceMedia(session,payload,chatId);
   const keyResult=await pool.query('SELECT api_key_ciphertext,model FROM assistant_settings WHERE workspace_id=$1',[session.workspace_id]);
   const key=decrypt(keyResult.rows[0]?.api_key_ciphertext || '');
   if (!key) throw new Error('Gemini API key is missing for voice transcription.');
   const configured=String(keyResult.rows[0]?.model || 'gemini-3.8-flash').replace(/^models\//,'');
-  const models=[...new Set([configured,'gemini-3.8-flash','gemini-3.1-flash-lite','gemini-2.5-flash','gemini-2.5-flash-lite'])];
+  const models=[...new Set([configured,'gemini-3.8-flash','gemini-3.5-flash-lite','gemini-3.1-flash-lite'])];
   const api='https://generativelanguage.googleapis.com/v1beta';
-  let lastError='No compatible Gemini model returned a transcription.';
+  const failures=[];
   for (const model of models) {
     try {
       const response=await fetch(api+'/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({contents:[{role:'user',parts:[
-          {text:'حوّل الرسالة الصوتية التالية إلى نص كما قالها المتحدث، باللغة العربية ولهجته الأصلية، غالبًا اللهجة المصرية. أعد النص المفرغ فقط دون تلخيص أو إجابة أو مقدمات. إذا لم يوجد كلام مفهوم فأعد عبارة: [الصوت غير واضح].'},
-          {inlineData:{mimeType:mime,data:bytes.toString('base64')}}
-        ]}],generationConfig:{temperature:0,maxOutputTokens:700}}),
-        signal:AbortSignal.timeout(45000)
+          {text:'حوّل الرسالة الصوتية التالية إلى نص حرفي كما قاله المتحدث، باللغة العربية ولهجته الأصلية، وخصوصًا اللهجة المصرية. لا تلخص ولا تجب عن السؤال. أعد الكلام المنطوق فقط دون مقدمات. إذا لم يوجد كلام مفهوم فأعد [الصوت غير واضح].'},
+          {inlineData:{mimeType:media.mime,data:media.bytes.toString('base64')}}
+        ]}],generationConfig:{temperature:0,maxOutputTokens:1000}}),
+        signal:AbortSignal.timeout(90000)
       });
       const data=await response.json().catch(()=>({}));
-      if (!response.ok) { lastError=String(data.error?.message || 'Gemini HTTP '+response.status); console.warn('[Voice transcription model failed]',model,lastError); continue; }
+      if (!response.ok) {
+        const reason=String(data.error?.message || 'Gemini HTTP '+response.status);
+        failures.push(model+': '+reason);
+        console.warn('[Voice transcription model failed]',model,reason);
+        if ([401,403].includes(response.status) && /API_KEY_INVALID|API key not valid|permission|leaked/i.test(reason)) break;
+        continue;
+      }
       const transcript=String(data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'').trim();
-      if (transcript) { console.log('[Voice transcription complete]',model,'bytes='+bytes.length,'mime='+mime); return transcript; }
-    } catch(e) { lastError=e.message; console.warn('[Voice transcription model failed]',model,e.message); }
+      if (transcript && transcript!=='[الصوت غير واضح]') {
+        console.log('[Voice transcription complete]',{model,bytes:media.bytes.length,mime:media.mime});
+        return {transcript,mediaPath:media.mediaPath,mime:media.mime};
+      }
+      failures.push(model+': empty or unclear transcription');
+    } catch(e) {
+      failures.push(model+': '+e.message);
+      console.warn('[Voice transcription model failed]',model,e.message);
+    }
   }
-  throw new Error('Voice transcription failed: '+lastError);
+  throw new Error('Voice transcription failed: '+failures.slice(0,6).join(' | ').slice(0,1200));
+}
+async function sendVoiceFailureReply(session,contact) {
+  const settings=(await pool.query('SELECT enabled FROM assistant_settings WHERE workspace_id=$1',[session.workspace_id])).rows[0];
+  const fresh=await getContact(session.workspace_id,contact.id);
+  if (!settings?.enabled || fresh?.is_paused) return;
+  const text='وصلتني رسالتك الصوتية، بس مقدرتش أحولها لنص بوضوح. ممكن تبعتها تاني أو تكتبلي سؤالك؟';
+  try {
+    const sent=await waha('POST','/api/sendText',{session:session.waha_name,chatId:contact.chat_id,text});
+    await pool.query(
+      "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status) VALUES($1,$2,$3,$4,$5,'outbound','text',$6,'sent') ON CONFLICT(session_id,wamid) DO NOTHING",
+      [newId(),session.workspace_id,session.id,contact.id,String(sent?.id || 'voice-fallback-'+newId()),text]
+    );
+  } catch(e) { console.error('[Voice fallback reply failed]',e.message); }
+}
+async function processIncomingVoice(session,contact,messageRowId,payload) {
+  try {
+    const result=await transcribeVoiceMessage(session,payload,contact.chat_id);
+    const body='🎤 رسالة صوتية:\n'+result.transcript;
+    await pool.query(
+      "UPDATE messages SET body=$1,media_url=$2,media_mimetype=$3,transcription_status='completed' WHERE id=$4",
+      [body,result.mediaPath,result.mime,messageRowId]
+    );
+    console.log('[Voice message saved and transcribed]',{contactId:contact.id,messageId:messageRowId,transcriptLength:result.transcript.length});
+    const fresh=await getContact(session.workspace_id,contact.id);
+    if (fresh) await assistantReply(session,fresh);
+  } catch(e) {
+    await pool.query(
+      "UPDATE messages SET body='🎤 رسالة صوتية (تعذر تحويلها إلى نص تلقائيًا)',transcription_status='failed' WHERE id=$1",
+      [messageRowId]
+    ).catch(dbError=>console.error('[Voice status save failed]',dbError.message));
+    console.error('[Voice message processing]',e.message);
+    await sendVoiceFailureReply(session,contact);
+  }
 }
 async function assistantReply(session,contact) {
   const sr=await pool.query('SELECT * FROM assistant_settings WHERE workspace_id=$1',[session.workspace_id]), settings=sr.rows[0];
@@ -372,38 +473,45 @@ app.post('/webhooks/waha',express.raw({type:'application/json',limit:'2mb'}),asy
   const chatId=String(p.from || p.chatId || '');
   if (!chatId || chatId.endsWith('@g.us') || chatId==='status@broadcast') return res.status(200).json({ok:true,ignored:true});
   let body=String(p.body || p.caption || '').trim();
-  const incomingMime=String(p.media?.mimetype || '').toLowerCase();
-  const isVoice=incomingMime.startsWith('audio/') || /^(ptt|audio)$/i.test(String(p.type || ''));
-  if (isVoice) {
-    try {
-      const transcript=await transcribeVoiceMessage(session,p);
-      body='[رسالة صوتية مفرغة]: '+transcript;
-      console.log('[Voice message received]',{session:sessionName,mime:incomingMime,transcriptLength:transcript.length});
-    } catch(e) {
-      console.error('[Voice message processing]',e.message);
-      return res.status(200).json({ok:true,voiceError:true});
-    }
-  }
-  if (!body) return res.status(200).json({ok:true,ignored:true});
-  const client=await pool.connect(); let contact;
+  const isVoice=isVoiceMessage(p);
+  if (!body && !isVoice) return res.status(200).json({ok:true,ignored:true});
+  if (isVoice) body='🎤 رسالة صوتية (جارٍ تحويلها إلى نص...)';
+  const client=await pool.connect(); let contact, messageRowId, wasInserted=false;
   try {
     await client.query('BEGIN');
     contact=await upsertContact(client,session,chatId,p.pushName || p._data?.notifyName || 'عميل');
-    // Honor simple opt-out keywords immediately and remove the contact from future campaigns.
-    if (/^(STOP|UNSUBSCRIBE|إلغاء|الغاء|توقف|إيقاف|ايقاف)$/i.test(body.trim())) {
+    if (/^(STOP|UNSUBSCRIBE|إلغاء|الغاء|توقف|إيقاف|ايقاف)$/i.test(String(p.body || '').trim())) {
       await client.query("UPDATE contacts SET marketing_opt_in=FALSE,marketing_opt_in_at=NULL,marketing_opt_in_source='customer-opt-out' WHERE id=$1",[contact.id]);
     }
-    const wamid=typeof p.id==='string'?p.id:(p.id?._serialized || p.id?.id || newId());
-    await client.query("INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at) VALUES($1,$2,$3,$4,$5,'inbound',$6,$7,'received',NOW()) ON CONFLICT(session_id,wamid) DO NOTHING",
-      [newId(),session.workspace_id,session.id,contact.id,String(wamid),String(p.type || 'text'),body]);
+    const rawId=typeof p.id==='string'?p.id:(p.id?._serialized || p.id?.id || newId());
+    const messageId=newId();
+    const mediaPath=wahaMediaPath(p.media?.url || p.mediaUrl || '');
+    const mime=String(p.media?.mimetype || (isVoice?'audio/ogg':'')).toLowerCase().split(';')[0];
+    const type=isVoice && !String(p.type||'').trim()? 'ptt' : String(p.type || (isVoice?'ptt':'text'));
+    const saved=await client.query(
+      "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at,media_url,media_mimetype,transcription_status) VALUES($1,$2,$3,$4,$5,'inbound',$6,$7,'received',NOW(),$8,$9,$10) ON CONFLICT(session_id,wamid) DO NOTHING RETURNING id",
+      [messageId,session.workspace_id,session.id,contact.id,String(rawId),type,body,mediaPath,mime,isVoice?'pending':'none']
+    );
+    if (saved.rowCount) { messageRowId=saved.rows[0].id; wasInserted=true; }
+    else {
+      const existing=await client.query("SELECT id,transcription_status FROM messages WHERE session_id=$1 AND wamid=$2",[session.id,String(rawId)]);
+      messageRowId=existing.rows[0]?.id;
+      wasInserted=false;
+    }
     await client.query('COMMIT');
   } catch(e) {
     await client.query('ROLLBACK'); console.error('[Webhook]',e.message); return res.status(500).json({error:'Could not save message.'});
   } finally { client.release(); }
-  res.status(200).json({ok:true});
-  setImmediate(()=>assistantReply(session,contact).catch(e=>console.error('[Assistant]',e.message)));
-});
-
+  res.status(200).json({ok:true,voiceQueued:isVoice});
+  if (isVoice && messageRowId) {
+    const current=(await pool.query('SELECT transcription_status FROM messages WHERE id=$1',[messageRowId])).rows[0];
+    if (current?.transcription_status!=='completed') {
+      setImmediate(()=>processIncomingVoice(session,contact,messageRowId,p).catch(e=>console.error('[Voice worker]',e.message)));
+    }
+  } else if (wasInserted) {
+    setImmediate(()=>assistantReply(session,contact).catch(e=>console.error('[Assistant]',e.message)));
+  }
+  
 app.use(express.json({limit:'1mb'}));
 app.use('/v1/auth',rate);
 
@@ -652,9 +760,31 @@ app.get('/v1/conversations/:id/messages',auth,async (req,res)=>{
       finally { client.release(); }
     } catch(e) { console.error('[Message history sync]',e.message); }
   }
-  const r=await pool.query('SELECT id,direction,message_type,body,status,sent_at FROM messages WHERE contact_id=$1 ORDER BY sent_at ASC LIMIT 500',[c.id]);
+  const r=await pool.query("SELECT id,direction,message_type,body,status,sent_at,media_mimetype,transcription_status,(media_url<>'') AS has_media FROM messages WHERE contact_id=$1 ORDER BY sent_at ASC LIMIT 500",[c.id]);
   res.json({contact:{id:c.id,name:c.display_name,phoneNumber:c.phone_number,isPaused:c.is_paused},messages:r.rows});
 });
+app.get('/v1/conversations/:id/messages/:messageId/media',auth,async(req,res)=>{
+  const contact=await getContact(req.actor.workspaceId,req.params.id);
+  if(!contact)return res.status(404).json({error:'المحادثة غير موجودة.'});
+  const row=(await pool.query(
+    "SELECT media_url,media_mimetype FROM messages WHERE id=$1 AND contact_id=$2 AND workspace_id=$3",
+    [req.params.messageId,contact.id,req.actor.workspaceId]
+  )).rows[0];
+  if(!row?.media_url)return res.status(404).json({error:'ملف الصوت غير متاح.'});
+  const mediaPath=wahaMediaPath(row.media_url);
+  if(!mediaPath)return res.status(404).json({error:'مسار الملف غير صالح.'});
+  try {
+    const base=String(process.env.WAHA_URL||'').replace(/\/+$/,'');
+    const remote=await fetch(base+mediaPath,{headers:{'X-Api-Key':process.env.WAHA_API_KEY},signal:AbortSignal.timeout(60000)});
+    if(!remote.ok)return res.status(remote.status).json({error:'تعذر تحميل الملف الصوتي.'});
+    const bytes=Buffer.from(await remote.arrayBuffer());
+    res.setHeader('Content-Type',row.media_mimetype || remote.headers.get('content-type') || 'audio/ogg');
+    res.setHeader('Content-Length',String(bytes.length));
+    res.setHeader('Cache-Control','private, no-store');
+    res.status(200).send(bytes);
+  } catch(e) { console.error('[Voice media proxy]',e.message);res.status(502).json({error:'تعذر تحميل الملف الصوتي.'}); }
+});
+
 app.post('/v1/conversations/:id/messages',auth,async (req,res)=>{
   const c=await getContact(req.actor.workspaceId,req.params.id), text=String(req.body.text || '').trim();
   if (!c) return res.status(404).json({error:'المحادثة غير موجودة.'});
