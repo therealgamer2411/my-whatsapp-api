@@ -94,7 +94,8 @@ function verifyWebhook(raw,headers) {
   return same(headers['x-webhook-hmac'],expected);
 }
 async function aiCompletion(settings,history) {
-  const messages=[{role:'system',content:settings.system_prompt}];
+  const systemPrompt=customerArabicPrompt(settings.system_prompt);
+  const messages=[{role:'system',content:systemPrompt}];
   for (const row of history) messages.push({role:row.direction==='inbound'?'user':'assistant',content:row.body});
   if (settings.provider==='gemini') {
     const key=decrypt(settings.api_key_ciphertext);
@@ -124,7 +125,7 @@ async function aiCompletion(settings,history) {
         const response=await fetch(api+'/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{
           method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({
-            systemInstruction:{parts:[{text:String(settings.system_prompt||'أنت مساعد خدمة عملاء محترف. أجب بناءً على معلومات المنتج المتاحة ولا تخترع بيانات.')} ]},
+            systemInstruction:{parts:[{text:systemPrompt}]},
             contents,
             generationConfig:{temperature:0.4,maxOutputTokens:900}
           }),
@@ -141,7 +142,7 @@ async function aiCompletion(settings,history) {
         const answer=String(data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'').trim();
         if (answer) {
           console.log('[Gemini model selected]',model);
-          return answer;
+          return whatsappText(answer);
         }
         failures.push(model+': empty response');
       } catch(e) {
@@ -160,7 +161,58 @@ async function aiCompletion(settings,history) {
   });
   const data=await response.json().catch(()=>({}));
   if (!response.ok) throw new Error(data.error?.message || 'AI provider request failed.');
-  return String(data.choices?.[0]?.message?.content || '').trim();
+  return whatsappText(data.choices?.[0]?.message?.content || '');
+}
+function customerArabicPrompt(prompt) {
+  return String(prompt || 'أنت مساعد خدمة عملاء محترف. أجب بناءً على معلومات المنتج المتاحة ولا تخترع بيانات.') +
+    '\n\nتعليمات أسلوب إلزامية: تحدث مع العملاء باللهجة المصرية الطبيعية المهذبة والواضحة، وليس بالفصحى الرسمية. استخدم تعبيرات مصرية بسيطة مثل أهلاً بيك، تحت أمرك، تحب تعرف، من غير مبالغة أو افتعال. لا تطلب اسم المنتج أو رقم الموديل إذا كانت معلومات المنتج موجودة في تعليماتك أو سياق المحادثة؛ اشرح المنتج مباشرة، واسأل فقط عن معلومة ناقصة فعلًا. لا تستخدم Markdown مثل ** أو ## أو علامات backticks. اجعل الرد مناسبًا لرسائل واتساب، مختصرًا ومنظمًا، ولا تخترع مواصفات أو أسعارًا غير متاحة.';
+}
+function whatsappText(value) {
+  return String(value || '')
+    .replace(/\*\*(.*?)\*\*/gs,'*$1*')
+    .replace(/__(.*?)__/gs,'_$1_')
+    .replace(/^#{1,6}\s*/gm,'')
+    .replace(/^\s*[-•]\s+/gm,'• ')
+    .replace(/\x60([^\x60]+)\x60/g,'$1')
+    .trim();
+}
+async function transcribeVoiceMessage(session,payload) {
+  const media=payload.media || {};
+  const mime=String(media.mimetype || '').toLowerCase().split(';')[0];
+  if (!mime.startsWith('audio/')) return '';
+  if (!media.url) throw new Error('Voice message arrived without media.url; check WAHA media-download configuration.');
+  const base=String(process.env.WAHA_URL || '').replace(/\/+$/,'');
+  let path;
+  try { const u=new URL(media.url); path=u.pathname+u.search; }
+  catch { path=String(media.url).startsWith('/')?String(media.url):'/'+String(media.url); }
+  const fileResponse=await fetch(base+path,{headers:{'X-Api-Key':process.env.WAHA_API_KEY},signal:AbortSignal.timeout(30000)});
+  if (!fileResponse.ok) throw new Error('Could not download voice media from WAHA: HTTP '+fileResponse.status);
+  const bytes=Buffer.from(await fileResponse.arrayBuffer());
+  if (!bytes.length || bytes.length>20*1024*1024) throw new Error('Voice media is empty or exceeds the 20 MB processing limit.');
+  const keyResult=await pool.query('SELECT api_key_ciphertext,model FROM assistant_settings WHERE workspace_id=$1',[session.workspace_id]);
+  const key=decrypt(keyResult.rows[0]?.api_key_ciphertext || '');
+  if (!key) throw new Error('Gemini API key is missing for voice transcription.');
+  const configured=String(keyResult.rows[0]?.model || 'gemini-3.8-flash').replace(/^models\//,'');
+  const models=[...new Set([configured,'gemini-3.8-flash','gemini-3.1-flash-lite','gemini-2.5-flash','gemini-2.5-flash-lite'])];
+  const api='https://generativelanguage.googleapis.com/v1beta';
+  let lastError='No compatible Gemini model returned a transcription.';
+  for (const model of models) {
+    try {
+      const response=await fetch(api+'/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({contents:[{role:'user',parts:[
+          {text:'حوّل الرسالة الصوتية التالية إلى نص كما قالها المتحدث، باللغة العربية ولهجته الأصلية، غالبًا اللهجة المصرية. أعد النص المفرغ فقط دون تلخيص أو إجابة أو مقدمات. إذا لم يوجد كلام مفهوم فأعد عبارة: [الصوت غير واضح].'},
+          {inlineData:{mimeType:mime,data:bytes.toString('base64')}}
+        ]}],generationConfig:{temperature:0,maxOutputTokens:700}}),
+        signal:AbortSignal.timeout(45000)
+      });
+      const data=await response.json().catch(()=>({}));
+      if (!response.ok) { lastError=String(data.error?.message || 'Gemini HTTP '+response.status); console.warn('[Voice transcription model failed]',model,lastError); continue; }
+      const transcript=String(data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'').trim();
+      if (transcript) { console.log('[Voice transcription complete]',model,'bytes='+bytes.length,'mime='+mime); return transcript; }
+    } catch(e) { lastError=e.message; console.warn('[Voice transcription model failed]',model,e.message); }
+  }
+  throw new Error('Voice transcription failed: '+lastError);
 }
 async function assistantReply(session,contact) {
   const sr=await pool.query('SELECT * FROM assistant_settings WHERE workspace_id=$1',[session.workspace_id]), settings=sr.rows[0];
@@ -170,7 +222,7 @@ async function assistantReply(session,contact) {
   try {
     const answer=await aiCompletion(settings,mr.rows.reverse());
     if (!answer) return;
-    const sent=await waha('POST','/api/sendText',{session:session.waha_name,chatId:contact.chat_id,text:answer});
+    const sent=await waha('POST','/api/sendText',{session:session.waha_name,chatId:contact.chat_id,text:whatsappText(answer)});
     await pool.query(
       "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status) VALUES($1,$2,$3,$4,$5,'outbound','text',$6,'sent') ON CONFLICT(session_id,wamid) DO NOTHING",
       [newId(),session.workspace_id,session.id,contact.id,String(sent?.id || 'assistant-'+newId()),answer]);
@@ -204,7 +256,19 @@ app.post('/webhooks/waha',express.raw({type:'application/json',limit:'2mb'}),asy
   if (p.fromMe) return res.status(200).json({ok:true,ignored:true});
   const chatId=String(p.from || p.chatId || '');
   if (!chatId || chatId.endsWith('@g.us') || chatId==='status@broadcast') return res.status(200).json({ok:true,ignored:true});
-  const body=String(p.body || p.caption || '').trim();
+  let body=String(p.body || p.caption || '').trim();
+  const incomingMime=String(p.media?.mimetype || '').toLowerCase();
+  const isVoice=incomingMime.startsWith('audio/') || /^(ptt|audio)$/i.test(String(p.type || ''));
+  if (isVoice) {
+    try {
+      const transcript=await transcribeVoiceMessage(session,p);
+      body='[رسالة صوتية مفرغة]: '+transcript;
+      console.log('[Voice message received]',{session:sessionName,mime:incomingMime,transcriptLength:transcript.length});
+    } catch(e) {
+      console.error('[Voice message processing]',e.message);
+      return res.status(200).json({ok:true,voiceError:true});
+    }
+  }
   if (!body) return res.status(200).json({ok:true,ignored:true});
   const client=await pool.connect(); let contact;
   try {
