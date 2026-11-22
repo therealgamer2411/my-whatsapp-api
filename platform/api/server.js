@@ -88,6 +88,17 @@ async function upsertContact(client,session,chatId,name) {
     [newId(),session.workspace_id,session.id,chatId,phone,String(name || 'عميل').slice(0,120)]);
   return r.rows[0];
 }
+async function ensureDefaultSecretary(workspaceId) {
+  await pool.query(`
+    INSERT INTO ai_secretaries(id,workspace_id,name,category,description,system_prompt,is_default)
+    SELECT gen_random_uuid(),a.workspace_id,'السكرتير العام','general',
+      'السكرتير الافتراضي للمحادثات التي لا تحتاج إلى تخصص محدد.',a.system_prompt,TRUE
+    FROM assistant_settings a
+    WHERE a.workspace_id=$1
+      AND NOT EXISTS (SELECT 1 FROM ai_secretaries s WHERE s.workspace_id=a.workspace_id AND s.is_default=TRUE)
+    ON CONFLICT DO NOTHING
+  `,[workspaceId]);
+}
 function verifyWebhook(raw,headers) {
   if (!same(headers['x-mf-webhook-secret'],process.env.WAHA_WEBHOOK_HEADER_SECRET)) return false;
   const expected=crypto.createHmac('sha512',process.env.WAHA_WEBHOOK_HMAC_KEY).update(raw).digest('hex');
@@ -163,6 +174,92 @@ async function aiCompletion(settings,history) {
   if (!response.ok) throw new Error(data.error?.message || 'AI provider request failed.');
   return whatsappText(data.choices?.[0]?.message?.content || '');
 }
+async function classifySecretary(settings,candidates,history) {
+  const fallback=candidates.find(s=>s.is_default) || candidates[0];
+  if (!fallback) throw new Error('No secretary profile is configured.');
+  const specialists=candidates.filter(s=>!s.is_default);
+  if (!specialists.length) return {secretary:fallback,category:'general',confidence:1,reason:'لا توجد سكرتارية متخصصة مفعّلة.',source:'auto'};
+  const payload={
+    recentConversation:history.slice(-10).map(m=>({from:m.direction==='inbound'?'customer':'business',text:String(m.body||'').slice(0,1400)})),
+    availableSecretaries:candidates.map(s=>({
+      id:s.id,name:s.name,category:s.category,description:s.description,
+      keywords:Array.isArray(s.keywords)?s.keywords:[]
+    }))
+  };
+  const classifierPrompt=[
+    'أنت محرك توجيه محادثات لخدمة عملاء متعددة السكرتارية.',
+    'حلل موضوع العميل ونيته من الرسائل الأخيرة والسياق، واختر سكرتيرًا واحدًا فقط من القائمة.',
+    'لا تخترع معرفًا ولا تخترع تخصصًا. استخدم السكرتير العام إذا كان الموضوع غير واضح أو لا يناسب أي تخصص.',
+    'يمكن أن تكون الرسائل باللهجة المصرية أو العربية أو الإنجليزية، وقد تكون قصيرة أو بها أخطاء إملائية.',
+    'أعد JSON صالحًا فقط دون Markdown أو أي نص إضافي، بالحقول: secretary_id (المعرف حرفيًا من القائمة)، category (اسم التصنيف المختصر)، confidence (رقم من 0 إلى 1)، reason (سبب موجز بالعربية).'
+  ].join('\n');
+  const raw=await aiCompletion(
+    {...settings,system_prompt:classifierPrompt},
+    [{direction:'inbound',body:JSON.stringify(payload)}]
+  );
+  let parsed;
+  try {
+    const match=String(raw||'').match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('Classifier did not return JSON.');
+    parsed=JSON.parse(match[0]);
+  } catch(e) {
+    console.warn('[Secretary classifier parse failed]',e.message);
+    return {secretary:fallback,category:'general',confidence:0,reason:'تعذر قراءة نتيجة التصنيف؛ تم استخدام السكرتير العام.',source:'auto'};
+  }
+  const chosen=candidates.find(s=>s.id===String(parsed.secretary_id||''));
+  let confidence=Number(parsed.confidence);
+  if (confidence>1 && confidence<=100) confidence/=100;
+  if (!Number.isFinite(confidence)) confidence=0;
+  confidence=Math.max(0,Math.min(1,confidence));
+  if (!chosen || confidence<0.58) {
+    return {secretary:fallback,category:String(parsed.category||'general').slice(0,80),confidence,reason:String(parsed.reason||'التصنيف غير مؤكد؛ تم استخدام السكرتير العام.').slice(0,500),source:'auto'};
+  }
+  return {
+    secretary:chosen,
+    category:String(parsed.category||chosen.category||'general').slice(0,80),
+    confidence,
+    reason:String(parsed.reason||'تم اختيار السكرتير وفق موضوع المحادثة.').slice(0,500),
+    source:chosen.is_default?'auto':'ai'
+  };
+}
+async function resolveSecretary(session,contact,settings,history) {
+  await ensureDefaultSecretary(session.workspace_id);
+  if (contact.secretary_assignment==='manual' && contact.secretary_id) {
+    const manual=(await pool.query(
+      'SELECT * FROM ai_secretaries WHERE id=$1 AND workspace_id=$2 AND enabled=TRUE',
+      [contact.secretary_id,session.workspace_id]
+    )).rows[0];
+    if (manual) return {secretary:manual,source:'manual',category:manual.category,confidence:1,reason:'تخصيص يدوي من لوحة التحكم.'};
+  }
+  const campaignSecretary=(await pool.query(`
+    SELECT s.*,c.title AS campaign_title
+    FROM campaign_recipients cr
+    JOIN campaigns c ON c.id=cr.campaign_id AND c.workspace_id=cr.workspace_id
+    JOIN ai_secretaries s ON s.id=c.secretary_id AND s.workspace_id=c.workspace_id AND s.enabled=TRUE
+    WHERE cr.contact_id=$1 AND cr.workspace_id=$2 AND cr.status='sent'
+    ORDER BY cr.sent_at DESC NULLS LAST
+    LIMIT 1
+  `,[contact.id,session.workspace_id])).rows[0];
+  if (campaignSecretary) {
+    const reason='مخصص للحملة: '+String(campaignSecretary.campaign_title||'').slice(0,180);
+    await pool.query(
+      "UPDATE contacts SET secretary_id=$1,secretary_assignment='campaign',secretary_category=$2,secretary_confidence=1,secretary_reason=$3 WHERE id=$4",
+      [campaignSecretary.id,campaignSecretary.category,reason,contact.id]
+    );
+    return {secretary:campaignSecretary,source:'campaign',category:campaignSecretary.category,confidence:1,reason};
+  }
+  const candidates=(await pool.query(
+    'SELECT * FROM ai_secretaries WHERE workspace_id=$1 AND enabled=TRUE ORDER BY is_default DESC,created_at ASC LIMIT 30',
+    [session.workspace_id]
+  )).rows;
+  if (!candidates.length) throw new Error('No active secretary profile exists.');
+  const route=await classifySecretary(settings,candidates,history);
+  await pool.query(
+    'UPDATE contacts SET secretary_id=$1,secretary_assignment=$2,secretary_category=$3,secretary_confidence=$4,secretary_reason=$5 WHERE id=$6',
+    [route.secretary.id,route.source,route.category,route.confidence,route.reason,contact.id]
+  );
+  return route;
+}
 function customerArabicPrompt(prompt) {
   return String(prompt || 'أنت مساعد خدمة عملاء محترف. أجب بناءً على معلومات المنتج المتاحة ولا تخترع بيانات.') +
     '\n\nتعليمات أسلوب إلزامية: تحدث مع العملاء باللهجة المصرية الطبيعية المهذبة والواضحة، وليس بالفصحى الرسمية. استخدم تعبيرات مصرية بسيطة مثل أهلاً بيك، تحت أمرك، تحب تعرف، من غير مبالغة أو افتعال. لا تطلب اسم المنتج أو رقم الموديل إذا كانت معلومات المنتج موجودة في تعليماتك أو سياق المحادثة؛ اشرح المنتج مباشرة، واسأل فقط عن معلومة ناقصة فعلًا. لا تستخدم Markdown مثل ** أو ## أو علامات backticks. اجعل الرد مناسبًا لرسائل واتساب، مختصرًا ومنظمًا، ولا تخترع مواصفات أو أسعارًا غير متاحة.';
@@ -220,7 +317,18 @@ async function assistantReply(session,contact) {
   const mr=await pool.query('SELECT direction,body FROM messages WHERE contact_id=$1 ORDER BY sent_at DESC LIMIT 14',[contact.id]);
   if (!mr.rowCount) return;
   try {
-    const answer=await aiCompletion(settings,mr.rows.reverse());
+    const history=mr.rows.reverse();
+    const route=await resolveSecretary(session,contact,settings,history);
+    const secretary=route.secretary;
+    const effectiveSettings={
+      ...settings,
+      system_prompt:[settings.system_prompt,secretary.system_prompt].filter(Boolean).join('\n\n')
+    };
+    console.log('[Secretary routed]',{
+      contactId:contact.id,secretaryId:secretary.id,secretaryName:secretary.name,
+      source:route.source,category:route.category,confidence:route.confidence
+    });
+    const answer=await aiCompletion(effectiveSettings,history);
     if (!answer) return;
     const sent=await waha('POST','/api/sendText',{session:session.waha_name,chatId:contact.chat_id,text:whatsappText(answer)});
     await pool.query(
@@ -305,6 +413,7 @@ app.post('/v1/auth/register',async (req,res)=>{
     const w=await client.query('INSERT INTO workspaces(id,name,slug) VALUES($1,$2,$3) RETURNING id,name,slug',[workspaceId,workspaceName,makeSlug(workspaceName)]);
     await client.query('INSERT INTO workspace_members(workspace_id,user_id,role) VALUES($1,$2,$3)',[workspaceId,userId,'owner']);
     await client.query('INSERT INTO assistant_settings(workspace_id) VALUES($1)',[workspaceId]);
+    await client.query("INSERT INTO ai_secretaries(id,workspace_id,name,category,description,system_prompt,is_default) VALUES($1,$2,'السكرتير العام','general','السكرتير الافتراضي للمحادثات العامة.','',TRUE)",[newId(),workspaceId]);
     await client.query("INSERT INTO workspace_subscriptions(workspace_id,plan_id,status) VALUES($1,'starter','trial')",[workspaceId]);
     await client.query('COMMIT');
     res.status(201).json({token:tokenFor(u.rows[0],w.rows[0],'owner'),user:u.rows[0],workspace:w.rows[0]});
@@ -442,10 +551,75 @@ app.delete('/v1/whatsapp/sessions/:id',auth,roles(['owner','admin']),async (req,
   res.json({ok:true});
 });
 
+app.get('/v1/secretaries',auth,async(req,res)=>{
+  try {
+    await ensureDefaultSecretary(req.actor.workspaceId);
+    const r=await pool.query(
+      'SELECT id,name,category,description,system_prompt,keywords,enabled,is_default,created_at,updated_at FROM ai_secretaries WHERE workspace_id=$1 ORDER BY is_default DESC,created_at ASC',
+      [req.actor.workspaceId]
+    );
+    res.json({secretaries:r.rows});
+  } catch(e) { console.error('[Secretaries list]',e.message); res.status(500).json({error:'تعذر تحميل السكرتيرين.'}); }
+});
+app.post('/v1/secretaries',auth,roles(['owner','admin']),async(req,res)=>{
+  const x=req.body||{},name=String(x.name||'').trim().slice(0,100);
+  const category=String(x.category||'').trim().slice(0,80);
+  const description=String(x.description||'').trim().slice(0,1200);
+  const prompt=String(x.systemPrompt||'').trim().slice(0,12000);
+  const keywords=Array.isArray(x.keywords)?x.keywords.map(v=>String(v).trim().slice(0,60)).filter(Boolean).slice(0,40):[];
+  if(name.length<2||category.length<2||description.length<8||prompt.length<10)
+    return res.status(400).json({error:'أدخل اسم السكرتير وتصنيفه ووصفه وتعليماته التفصيلية.'});
+  try {
+    const r=await pool.query(
+      'INSERT INTO ai_secretaries(id,workspace_id,name,category,description,system_prompt,keywords) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,category,description,system_prompt,keywords,enabled,is_default,created_at',
+      [newId(),req.actor.workspaceId,name,category,description,prompt,keywords]
+    );
+    res.status(201).json({secretary:r.rows[0]});
+  } catch(e) {
+    if(e.code==='23505') return res.status(409).json({error:'يوجد سكرتير بهذا الاسم بالفعل.'});
+    console.error('[Secretary create]',e.message);res.status(500).json({error:'تعذر إنشاء السكرتير.'});
+  }
+});
+app.patch('/v1/secretaries/:id',auth,roles(['owner','admin']),async(req,res)=>{
+  const x=req.body||{},name=String(x.name||'').trim().slice(0,100),category=String(x.category||'').trim().slice(0,80);
+  const description=String(x.description||'').trim().slice(0,1200),prompt=String(x.systemPrompt||'').trim().slice(0,12000);
+  const keywords=Array.isArray(x.keywords)?x.keywords.map(v=>String(v).trim().slice(0,60)).filter(Boolean).slice(0,40):[];
+  if(name.length<2||category.length<2||description.length<8||prompt.length<10)return res.status(400).json({error:'أكمل بيانات السكرتير.'});
+  const r=await pool.query(
+    'UPDATE ai_secretaries SET name=$1,category=$2,description=$3,system_prompt=$4,keywords=$5,updated_at=NOW() WHERE id=$6 AND workspace_id=$7 RETURNING id,name,category,description,system_prompt,keywords,enabled,is_default',
+    [name,category,description,prompt,keywords,req.params.id,req.actor.workspaceId]
+  );
+  if(!r.rowCount)return res.status(404).json({error:'السكرتير غير موجود.'});
+  res.json({secretary:r.rows[0]});
+});
+app.delete('/v1/secretaries/:id',auth,roles(['owner','admin']),async(req,res)=>{
+  const r=await pool.query('DELETE FROM ai_secretaries WHERE id=$1 AND workspace_id=$2 AND is_default=FALSE RETURNING id',[req.params.id,req.actor.workspaceId]);
+  if(!r.rowCount)return res.status(404).json({error:'السكرتير غير موجود أو لا يمكن حذف السكرتير العام.'});
+  await pool.query("UPDATE contacts SET secretary_assignment='auto',secretary_category='general',secretary_confidence=0,secretary_reason='تم حذف السكرتير السابق.' WHERE workspace_id=$1 AND secretary_id IS NULL",[req.actor.workspaceId]);
+  res.json({ok:true});
+});
+
 app.get('/v1/conversations',auth,async (req,res)=>{
-  const r=await pool.query('SELECT c.id,c.session_id,c.chat_id,c.phone_number,c.display_name,c.is_paused,c.marketing_opt_in,c.last_message_at,s.label AS session_label,s.status AS session_status,m.body AS last_message,m.direction AS last_direction,m.sent_at AS last_message_time FROM contacts c JOIN wa_sessions s ON s.id=c.session_id LEFT JOIN LATERAL(SELECT body,direction,sent_at FROM messages WHERE contact_id=c.id ORDER BY sent_at DESC LIMIT 1)m ON TRUE WHERE c.workspace_id=$1 ORDER BY c.last_message_at DESC NULLS LAST LIMIT 150',[req.actor.workspaceId]);
+  const r=await pool.query('SELECT c.id,c.session_id,c.chat_id,c.phone_number,c.display_name,c.is_paused,c.marketing_opt_in,c.secretary_id,c.secretary_assignment,c.secretary_category,c.secretary_confidence,c.secretary_reason,sec.name AS secretary_name,c.last_message_at,s.label AS session_label,s.status AS session_status,m.body AS last_message,m.direction AS last_direction,m.sent_at AS last_message_time FROM contacts c JOIN wa_sessions s ON s.id=c.session_id LEFT JOIN ai_secretaries sec ON sec.id=c.secretary_id LEFT JOIN LATERAL(SELECT body,direction,sent_at FROM messages WHERE contact_id=c.id ORDER BY sent_at DESC LIMIT 1)m ON TRUE WHERE c.workspace_id=$1 ORDER BY c.last_message_at DESC NULLS LAST LIMIT 150',[req.actor.workspaceId]);
   res.json({conversations:r.rows});
 });
+app.patch('/v1/conversations/:id/secretary',auth,async(req,res)=>{
+  const contact=await getContact(req.actor.workspaceId,req.params.id);
+  if(!contact)return res.status(404).json({error:'المحادثة غير موجودة.'});
+  const secretaryId=String(req.body?.secretaryId||'').trim();
+  if(!secretaryId){
+    await pool.query("UPDATE contacts SET secretary_id=NULL,secretary_assignment='auto',secretary_category='general',secretary_confidence=0,secretary_reason='تم تفعيل التوجيه الذكي التلقائي.' WHERE id=$1",[contact.id]);
+    return res.json({ok:true,assignment:'auto'});
+  }
+  const secretary=(await pool.query('SELECT id,name,category FROM ai_secretaries WHERE id=$1 AND workspace_id=$2 AND enabled=TRUE',[secretaryId,req.actor.workspaceId])).rows[0];
+  if(!secretary)return res.status(400).json({error:'السكرتير المحدد غير متاح في مساحة العمل.'});
+  await pool.query(
+    "UPDATE contacts SET secretary_id=$1,secretary_assignment='manual',secretary_category=$2,secretary_confidence=1,secretary_reason='تخصيص يدوي من لوحة التحكم.' WHERE id=$3",
+    [secretary.id,secretary.category,contact.id]
+  );
+  res.json({ok:true,assignment:'manual',secretary});
+});
+
 app.get('/v1/conversations/:id/messages',auth,async (req,res)=>{
   const c=await getContact(req.actor.workspaceId,req.params.id);
   if (!c) return res.status(404).json({error:'المحادثة غير موجودة.'});
@@ -530,7 +704,7 @@ app.patch('/v1/contacts/:id/marketing-consent',auth,roles(['owner','admin']),asy
  res.json({contact:r.rows[0]});
 });
 app.get('/v1/campaigns',auth,async (req,res)=>{
- const r=await pool.query('SELECT id,title,status,total_count,sent_count,failed_count,delay_ms,created_at,updated_at FROM campaigns WHERE workspace_id=$1 ORDER BY created_at DESC LIMIT 100',[req.actor.workspaceId]);
+ const r=await pool.query('SELECT c.id,c.title,c.status,c.total_count,c.sent_count,c.failed_count,c.delay_ms,c.secretary_id,s.name AS secretary_name,c.created_at,c.updated_at FROM campaigns c LEFT JOIN ai_secretaries s ON s.id=c.secretary_id WHERE c.workspace_id=$1 ORDER BY c.created_at DESC LIMIT 100',[req.actor.workspaceId]);
  res.json({campaigns:r.rows});
 });
 app.get('/v1/campaigns/:id/recipients',auth,async(req,res)=>{
@@ -584,6 +758,11 @@ async function runCampaign(campaignId,workspaceId) {
 }
 app.post('/v1/campaigns',auth,roles(['owner','admin']),async (req,res)=>{
  const title=String(req.body?.title||'').trim().slice(0,120), body=String(req.body?.body||'').trim(), delay=Math.max(5000,Math.min(60000,Number(req.body?.delayMs||10000)));
+ const secretaryId=String(req.body?.secretaryId||'').trim()||null;
+ if(secretaryId){
+  const valid=await pool.query('SELECT id FROM ai_secretaries WHERE id=$1 AND workspace_id=$2 AND enabled=TRUE',[secretaryId,req.actor.workspaceId]);
+  if(!valid.rowCount)return res.status(400).json({error:'السكرتير المحدد للحملة غير موجود أو غير مفعّل.'});
+ }
  if(!title||!body||body.length>4000)return res.status(400).json({error:'أدخل اسم الحملة ورسالة صحيحة لا تتجاوز 4000 حرف.'});
  if(req.body?.confirmOptIn!==true)return res.status(400).json({error:'أكد أن جميع المستلمين وافقوا صراحةً على استقبال الرسائل.'});
  const ids=Array.isArray(req.body?.contactIds)?[...new Set(req.body.contactIds.map(String))].slice(0,5000):[];
@@ -595,7 +774,7 @@ app.post('/v1/campaigns',auth,roles(['owner','admin']),async (req,res)=>{
    ? await client.query("SELECT c.id,c.session_id FROM contacts c JOIN wa_sessions s ON s.id=c.session_id WHERE c.workspace_id=$1 AND c.marketing_opt_in=TRUE AND s.status IN ('WORKING','CONNECTED') ORDER BY c.created_at LIMIT 5000",[req.actor.workspaceId])
    : await client.query("SELECT c.id,c.session_id FROM contacts c JOIN wa_sessions s ON s.id=c.session_id WHERE c.workspace_id=$1 AND c.id=ANY($2::uuid[]) AND c.marketing_opt_in=TRUE AND s.status IN ('WORKING','CONNECTED')",[req.actor.workspaceId,ids]);
   if(!recipients.rowCount){await client.query('ROLLBACK');return res.status(400).json({error:'لا توجد جهات اتصال مؤهلة: يلزم تسجيل الموافقة وربط رقم متصل.'});}
-  await client.query("INSERT INTO campaigns(id,workspace_id,title,body,status,delay_ms,total_count) VALUES($1,$2,$3,$4,'queued',$5,$6)",[id,req.actor.workspaceId,title,body,delay,recipients.rowCount]);
+  await client.query("INSERT INTO campaigns(id,workspace_id,title,body,status,delay_ms,total_count,secretary_id) VALUES($1,$2,$3,$4,'queued',$5,$6,$7)",[id,req.actor.workspaceId,title,body,delay,recipients.rowCount,secretaryId]);
   for(const row of recipients.rows)await client.query("INSERT INTO campaign_recipients(id,campaign_id,workspace_id,contact_id,session_id) VALUES($1,$2,$3,$4,$5)",[newId(),id,req.actor.workspaceId,row.id,row.session_id]);
   await client.query('COMMIT');res.status(201).json({ok:true,campaign:{id,totalCount:recipients.rowCount,status:'queued',delayMs:delay}});
   setImmediate(()=>runCampaign(id,req.actor.workspaceId));
@@ -641,6 +820,7 @@ async function start() {
   const needed=['DATABASE_URL','JWT_SECRET','SECRET_ENCRYPTION_KEY'];
   for (const key of needed) if (!process.env[key]) throw new Error(key+' is required.');
   await pool.query(fs.readFileSync(path.join(__dirname,'schema.sql'),'utf8'));
+  await pool.query("INSERT INTO ai_secretaries(id,workspace_id,name,category,description,system_prompt,is_default) SELECT gen_random_uuid(),a.workspace_id,'السكرتير العام','general','السكرتير الافتراضي للمحادثات العامة.',a.system_prompt,TRUE FROM assistant_settings a WHERE NOT EXISTS (SELECT 1 FROM ai_secretaries s WHERE s.workspace_id=a.workspace_id AND s.is_default=TRUE) ON CONFLICT DO NOTHING");
   await pool.query("UPDATE assistant_settings SET model='gemini-3.8-flash',updated_at=NOW() WHERE provider='gemini' AND model IN ('gemini-2.5-flash','models/gemini-2.5-flash')");
   // Recover queued work after a process restart; campaign state is durable in PostgreSQL.
   await pool.query("UPDATE campaigns SET status='queued',updated_at=NOW() WHERE status='running'");
