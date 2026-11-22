@@ -500,36 +500,64 @@ app.post('/send', adminOnly, async (req, res) => {
 });
 
 async function runAiStartupDiagnostics() {
-  if (String(process.env.AI_STARTUP_DIAGNOSTICS || 'false').toLowerCase() !== 'true') return;
-  if (!process.env.GEMINI_API_KEY) {
-    console.error('[AI Diagnostics] SKIPPED: Gemini API key is missing.');
+  const enabled = String(process.env.AI_STARTUP_DIAGNOSTICS || 'false').toLowerCase() === 'true';
+  console.log('[AI Diagnostics] START enabled=' + enabled);
+  if (!enabled) return;
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) {
+    console.error('[AI Diagnostics] KEY_MISSING');
     return;
   }
 
   const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
   try {
-    const { GoogleGenAI } = await import('@google/genai');
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    const response = await ai.models.generateContent({
-      model,
-      contents: 'Reply with exactly: OK',
-      config: { temperature: 0, maxOutputTokens: 8 }
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(model) + ':generateContent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: 'Respond with exactly: OK' }] }],
+        generationConfig: { temperature: 0, maxOutputTokens: 8 }
+      }),
+      signal: AbortSignal.timeout(30000)
     });
-    if (!String(response.text || '').trim()) throw new Error('Gemini returned an empty response.');
-    console.log('[AI Diagnostics] TEXT_OK model=' + model);
+    const raw = await response.text();
+    if (!response.ok) throw new Error('REST HTTP ' + response.status + ': ' + raw.slice(0, 500));
+    const payload = JSON.parse(raw);
+    const text = payload.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('').trim();
+    if (!text) throw new Error('Gemini REST returned no text.');
+    console.log('[AI Diagnostics] REST_TEXT_OK model=' + model);
   } catch (error) {
-    console.error('[AI Diagnostics] TEXT_FAILED model=' + model + ' error=' + String(error.message || error).slice(0, 500));
+    console.error('[AI Diagnostics] REST_TEXT_FAILED: ' + String(error.message || error).slice(0, 650));
+  }
+
+  try {
+    const decision = await getDecision('السلام عليكم، ممكن أعرف خدماتكم؟', []);
+    if (!decision || !String(decision.reply || '').trim()) throw new Error('Assistant returned an empty reply.');
+    console.log('[AI Diagnostics] CHAT_LOGIC_OK replyChars=' + decision.reply.length + ' handoff=' + Boolean(decision.handoff));
+  } catch (error) {
+    console.error('[AI Diagnostics] CHAT_LOGIC_FAILED: ' + String(error.message || error).slice(0, 500));
+  }
+
+  let audio;
+  try {
+    audio = await synthesizeVoiceNote('ده اختبار صوتي قصير للسكرتير الذكي.');
+    console.log('[AI Diagnostics] TTS_OK bytes=' + audio.length);
+  } catch (error) {
+    console.error('[AI Diagnostics] TTS_FAILED: ' + String(error.message || error).slice(0, 500));
     return;
   }
 
   try {
-    const audio = await synthesizeVoiceNote('ده اختبار صوتي قصير للسكرتير الذكي.');
-    console.log('[AI Diagnostics] TTS_OK bytes=' + audio.length);
+    const transcript = await transcribeAudio({
+      data: audio.toString('base64'),
+      mimetype: 'audio/ogg'
+    });
+    console.log('[AI Diagnostics] STT_OK transcriptChars=' + transcript.length);
   } catch (error) {
-    console.error('[AI Diagnostics] TTS_FAILED error=' + String(error.message || error).slice(0, 500));
+    console.error('[AI Diagnostics] STT_FAILED: ' + String(error.message || error).slice(0, 500));
   }
 }
-
 app.listen(PORT, HOST, () => {
   console.log('[HTTP] Admin API: http://' + HOST + ':' + PORT);
   if (!ADMIN_TOKEN) console.warn('[Security] ADMIN_TOKEN missing; admin routes disabled.');
