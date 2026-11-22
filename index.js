@@ -359,7 +359,7 @@ function startWhatsApp() {
         ready = false;
         whatsappInitializing = false;
         whatsappLastError = error && error.message ? error.message : String(error || 'Initialization failed');
-        console.error('[WhatsApp] Initialization failed:', whatsappLastError);
+        console.error('[WhatsApp] Initialization failed:', error && error.stack ? error.stack : whatsappLastError);
       }).finally(() => {
         if (operationId !== whatsappOperationId) return;
         if (whatsappInitPromise === initPromise) whatsappInitPromise = null;
