@@ -226,6 +226,8 @@ const client = new Client({
     clientId: 'mohamed-secretary',
     dataPath: process.env.WWEBJS_AUTH_PATH || './.wwebjs_auth'
   }),
+  // whatsapp-web.js 1.34.8 waits for the WhatsApp socket to open; cloud cold starts can exceed 30s.
+  authTimeoutMs: Math.max(30000, Number(process.env.WWEBJS_AUTH_TIMEOUT_MS || 120000)),
   puppeteer: {
     headless: true,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -234,7 +236,10 @@ const client = new Client({
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--no-first-run',
-      '--disable-gpu'
+      '--disable-gpu',
+      '--disable-background-networking',
+      '--disable-renderer-backgrounding',
+      '--disable-background-timer-throttling'
     ]
   },
   takeoverOnConflict: false
@@ -510,6 +515,15 @@ async function runAiStartupDiagnostics() {
   }
 
   const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+  for (const url of ['https://www.google.com/generate_204', 'https://web.whatsapp.com']) {
+    const host = new URL(url).hostname;
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'manual' });
+      console.log('[AI Diagnostics] EGRESS_OK host=' + host + ' status=' + response.status);
+    } catch (error) {
+      console.error('[AI Diagnostics] EGRESS_FAILED host=' + host + ' error=' + String(error.message || error).slice(0, 250));
+    }
+  }
   try {
     const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' +
       encodeURIComponent(model) + ':generateContent', {
