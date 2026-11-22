@@ -45,6 +45,10 @@ export default function PlatformPage() {
   const [campaignBody, setCampaignBody] = useState("");
   const [campaignDelay, setCampaignDelay] = useState(10000);
   const [campaignConfirmed, setCampaignConfirmed] = useState(false);
+  const [campaignSecretaryId, setCampaignSecretaryId] = useState("");
+  const [secretaries, setSecretaries] = useState([]);
+  const [editingSecretaryId, setEditingSecretaryId] = useState("");
+  const [secretaryForm, setSecretaryForm] = useState({ name: "", category: "", description: "", systemPrompt: "", keywords: "" });
   const [importPhones, setImportPhones] = useState("");
   const [importSessionId, setImportSessionId] = useState("");
   const [consentSource, setConsentSource] = useState("نموذج موافقة موثق من العميل");
@@ -191,6 +195,15 @@ export default function PlatformPage() {
   }, [token, view, activeContact, request]);
 
   useEffect(() => {
+    if (!token || !["secretaries", "campaigns", "inbox"].includes(view)) return;
+    let active = true;
+    request("/v1/secretaries").then((data) => {
+      if (active) setSecretaries(data.secretaries || []);
+    }).catch((e) => { if (active) flash(e.message, true); });
+    return () => { active = false; };
+  }, [token, view, request]);
+
+  useEffect(() => {
     if (!token || view !== "assistant") return;
     request("/v1/assistant/settings").then((data) => {
       if (!data.settings) return;
@@ -306,13 +319,70 @@ export default function PlatformPage() {
     try {
       await request("/v1/campaigns", { method: "POST", body: JSON.stringify({
         title: campaignTitle, body: campaignBody, delayMs: Number(campaignDelay),
+        secretaryId: campaignSecretaryId || null,
         allOptedIn: true, confirmOptIn: campaignConfirmed
       })});
-      setCampaignTitle(""); setCampaignBody(""); setCampaignConfirmed(false);
+      setCampaignTitle(""); setCampaignBody(""); setCampaignSecretaryId(""); setCampaignConfirmed(false);
       const data = await request("/v1/campaigns"); setCampaigns(data.campaigns || []);
       flash("تم إنشاء الحملة. بدأ الإرسال وفق قائمة الموافقات المسجلة.");
     } catch (e) { flash(e.message, true); }
     finally { setBusy(false); }
+  }
+
+  async function saveSecretary(event) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const payload = {
+        ...secretaryForm,
+        keywords: secretaryForm.keywords.split(/[,،؛]+/).map(x => x.trim()).filter(Boolean)
+      };
+      const route = editingSecretaryId ? "/v1/secretaries/" + editingSecretaryId : "/v1/secretaries";
+      const data = await request(route, {
+        method: editingSecretaryId ? "PATCH" : "POST",
+        body: JSON.stringify(payload)
+      });
+      const directory = await request("/v1/secretaries");
+      setSecretaries(directory.secretaries || []);
+      setSecretaryForm({ name: "", category: "", description: "", systemPrompt: "", keywords: "" });
+      setEditingSecretaryId("");
+      flash(editingSecretaryId ? "تم تحديث السكرتير ومعرفته." : "تم إنشاء السكرتير المتخصص.");
+    } catch (e) { flash(e.message, true); }
+    finally { setBusy(false); }
+  }
+
+  function editSecretary(secretary) {
+    setEditingSecretaryId(secretary.id);
+    setSecretaryForm({
+      name: secretary.name || "",
+      category: secretary.category || "",
+      description: secretary.description || "",
+      systemPrompt: secretary.system_prompt || "",
+      keywords: Array.isArray(secretary.keywords) ? secretary.keywords.join("، ") : ""
+    });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  async function deleteSecretary(secretary) {
+    if (!window.confirm("حذف السكرتير «" + secretary.name + "»؟ ستعود المحادثات المرتبطة به إلى التوجيه الذكي التلقائي.")) return;
+    try {
+      await request("/v1/secretaries/" + secretary.id, { method: "DELETE" });
+      const directory = await request("/v1/secretaries");
+      setSecretaries(directory.secretaries || []);
+      flash("تم حذف السكرتير.");
+    } catch (e) { flash(e.message, true); }
+  }
+
+  async function assignConversationSecretary(secretaryId) {
+    if (!activeContact) return;
+    try {
+      await request("/v1/conversations/" + activeContact + "/secretary", {
+        method: "PATCH", body: JSON.stringify({ secretaryId: secretaryId || null })
+      });
+      const data = await request("/v1/conversations");
+      setConversations(data.conversations || []);
+      flash(secretaryId ? "تم تخصيص السكرتير لهذه المحادثة." : "تم تفعيل التوجيه الذكي التلقائي.");
+    } catch (e) { flash(e.message, true); }
   }
 
   async function campaignAction(id, action) {
@@ -416,6 +486,7 @@ export default function PlatformPage() {
     ["overview", "نظرة عامة", "⌂"],
     ["whatsapp", "حسابات واتساب", "◉"],
     ["inbox", "صندوق المحادثات", "▤"],
+    ["secretaries", "السكرتيرون المتخصصون", "✧"],
     ["assistant", "المساعد الذكي", "✧"],
     ["campaigns", "الحملات الجماعية", "▣"]
   ];
@@ -495,12 +566,21 @@ export default function PlatformPage() {
             {syncMessage && <div className="sync-feedback">{syncMessage}</div>}
             {conversations.length === 0 && <div className="empty-state">لا توجد رسائل واردة بعد. اربط رقم واتساب لتبدأ.</div>}
             {conversations.map((c) => <button key={c.id} className={"conversation-row " + (activeContact === c.id ? "chosen" : "")} onClick={async () => { setActiveContact(c.id); try { const d = await request("/v1/conversations/" + c.id + "/messages?sync=1"); setMessages(d.messages || []); } catch (e) { flash(e.message,true); } }}>
-              <div className="avatar contact-avatar">{(c.display_name || "ع").slice(0,1)}</div><div className="conversation-copy"><b>{c.display_name}</b><small>{c.last_message || c.phone_number || "لا توجد رسائل"}</small></div><span className="conversation-mark">{c.is_paused ? "يدوي" : "AI"}</span>
+              <div className="avatar contact-avatar">{(c.display_name || "ع").slice(0,1)}</div><div className="conversation-copy"><b>{c.display_name}</b><small>{c.last_message || c.phone_number || "لا توجد رسائل"}</small></div><span className="conversation-mark">{c.is_paused ? "يدوي" : (c.secretary_name || "توجيه ذكي")}</span>
             </button>)}
           </section>
           <section className="panel chat-panel">
             {!activeContact ? <div className="empty-qr"><div>▤</div><b>اختر محادثة</b><p>حدد عميلًا من القائمة لعرض الرسائل والرد عليه.</p></div> : <>
-              <div className="chat-head"><b>{conversations.find((c) => c.id === activeContact)?.display_name || "محادثة العميل"}</b><span>{conversations.find((c) => c.id === activeContact)?.phone_number}</span></div>
+              <div className="chat-head">
+                <div><b>{conversations.find((c) => c.id === activeContact)?.display_name || "محادثة العميل"}</b><span>{conversations.find((c) => c.id === activeContact)?.phone_number}</span></div>
+                <label className="secretary-inline-select">السكرتير المسؤول
+                  <select value={conversations.find((c) => c.id === activeContact)?.secretary_assignment === "manual" ? (conversations.find((c) => c.id === activeContact)?.secretary_id || "") : ""} onChange={(e) => assignConversationSecretary(e.target.value)}>
+                    <option value="">توجيه ذكي تلقائي</option>
+                    {secretaries.filter(s => s.enabled).map(s => <option key={s.id} value={s.id}>{s.name}{s.is_default ? " (عام)" : ""}</option>)}
+                  </select>
+                </label>
+                <small className="secretary-route-note">التصنيف: {conversations.find((c) => c.id === activeContact)?.secretary_category || "بانتظار التصنيف"} · {conversations.find((c) => c.id === activeContact)?.secretary_assignment === "manual" ? "يدوي" : conversations.find((c) => c.id === activeContact)?.secretary_assignment === "campaign" ? "حملة" : conversations.find((c) => c.id === activeContact)?.secretary_assignment === "ai" ? "ذكاء اصطناعي" : "تلقائي"}</small>
+              </div>
               <div className="chat-messages">{messages.map((m) => <div key={m.id} className={"chat-bubble " + (m.direction === "outbound" ? "out" : "in")}><p>{m.body}</p><small>{new Date(m.sent_at).toLocaleString("ar-EG")}</small></div>)}</div>
               <form className="composer" onSubmit={sendMessage}><input value={messageDraft} onChange={(e) => setMessageDraft(e.target.value)} placeholder="اكتب رسالة للعميل..." /><button className="mf-primary" disabled={busy || !messageDraft.trim()}>إرسال</button></form>
               <div className="takeover-row"><span>{conversations.find((c) => c.id === activeContact)?.is_paused ? "المساعد متوقف لهذه المحادثة بسبب التدخل اليدوي." : "المساعد الذكي يعمل تلقائيًا على هذه المحادثة."}</span><button type="button" onClick={() => togglePause(activeContact, !conversations.find((c) => c.id === activeContact)?.is_paused)}>{conversations.find((c) => c.id === activeContact)?.is_paused ? "استئناف المساعد" : "إيقاف المساعد"}</button></div>
@@ -516,6 +596,7 @@ export default function PlatformPage() {
             <form className="mf-form" onSubmit={createCampaign}>
               <label>اسم الحملة<input required value={campaignTitle} onChange={e=>setCampaignTitle(e.target.value)} placeholder="مثال: عرض نهاية الشهر"/></label>
               <label>نص الرسالة<textarea required rows={4} maxLength={4000} value={campaignBody} onChange={e=>setCampaignBody(e.target.value)} placeholder="اكتب الرسالة الموحدة هنا"/></label>
+              <label>السكرتير المسؤول عن ردود الحملة<select value={campaignSecretaryId} onChange={e=>setCampaignSecretaryId(e.target.value)}><option value="">يختار الذكاء الاصطناعي السكرتير المناسب</option>{secretaries.filter(s=>s.enabled).map(s=><option key={s.id} value={s.id}>{s.name}{s.is_default?" (عام)":""}</option>)}</select></label>
               <label>الفاصل التشغيلي بين الرسائل<select value={campaignDelay} onChange={e=>setCampaignDelay(Number(e.target.value))}><option value={10000}>10 ثوانٍ</option><option value={15000}>15 ثانية</option><option value={30000}>30 ثانية</option><option value={60000}>60 ثانية</option></select></label>
               <label className="consent-confirm"><input type="checkbox" checked={campaignConfirmed} onChange={e=>setCampaignConfirmed(e.target.checked)}/> أؤكد أن كل المستلمين وافقوا صراحةً على استقبال رسائل من هذا النشاط، وأن الرسالة متوافقة مع تفضيلاتهم.</label>
               <button className="mf-primary" disabled={busy || !campaignConfirmed}>إنشاء الحملة وإرسالها إلى جميع جهات الاتصال صاحبة الموافقة</button>
@@ -551,7 +632,31 @@ export default function PlatformPage() {
           </section>
           <div className="hint-panel"><span>ⓘ</span><p>الفواصل الزمنية هنا لتنظيم الحملات والتحكم في الحمل على الخادم، وليست وسيلة لتجاوز قيود واتساب أو ضمان عدم الحظر. أوقف الإرسال عند ظهور قيود أو شكاوى، واحترم طلبات إلغاء الاشتراك.</p></div>
         </div>}
-\n        {view === "assistant" && <div className="mf-content">
+\n        {view === "secretaries" && <div className="mf-content">
+          <section className="panel assistant-panel">
+            <div className="panel-head"><div><span className="eyebrow">SPECIALIZED AI SECRETARIES</span><h3>{editingSecretaryId ? "تعديل سكرتير متخصص" : "إنشاء سكرتير متخصص"}</h3></div><span className="state-pill">{secretaries.length} سكرتير</span></div>
+            <p className="muted">اكتب مجال السكرتير وشخصيته ومعلوماته وتعليماته. سيستخدمه نظام التوجيه الذكي عندما يكتشف أن المحادثة تناسب هذا التخصص.</p>
+            <form className="mf-form settings-form" onSubmit={saveSecretary}>
+              <label>اسم السكرتير<input required minLength={2} maxLength={100} value={secretaryForm.name} onChange={e=>setSecretaryForm({...secretaryForm,name:e.target.value})} placeholder="مثال: سكرتير مبيعات MSS"/></label>
+              <label>نوع المحادثات / التخصص<input required minLength={2} maxLength={80} value={secretaryForm.category} onChange={e=>setSecretaryForm({...secretaryForm,category:e.target.value})} placeholder="مثال: مبيعات طبية، دعم فني، حجوزات"/></label>
+              <label>وصف دوره ومتى يجب اختياره<textarea required rows={3} maxLength={1200} value={secretaryForm.description} onChange={e=>setSecretaryForm({...secretaryForm,description:e.target.value})} placeholder="يختص بالعملاء الذين يسألون عن نظام MSS الطبي، التخصصات، الأسعار، التشغيل والتعاقد."/></label>
+              <label>كلمات مفتاحية تساعد على التوجيه<input value={secretaryForm.keywords} onChange={e=>setSecretaryForm({...secretaryForm,keywords:e.target.value})} placeholder="MSS، عيادات، إدارة طبية، نظام طبي"/></label>
+              <label>معرفة السكرتير وتعليماته<textarea required rows={8} maxLength={12000} value={secretaryForm.systemPrompt} onChange={e=>setSecretaryForm({...secretaryForm,systemPrompt:e.target.value})} placeholder="ضع هنا معلومات المنتج والخدمات والمميزات والأسعار والسياسات والأسئلة الشائعة، ثم حدد أسلوب الرد وما يجب ألا يعد به العميل."/></label>
+              <div className="form-actions"><button className="mf-primary" disabled={busy}>{busy ? "جارٍ الحفظ..." : editingSecretaryId ? "حفظ التعديلات" : "إنشاء السكرتير"}</button>{editingSecretaryId && <button type="button" className="mf-secondary" onClick={()=>{setEditingSecretaryId("");setSecretaryForm({name:"",category:"",description:"",systemPrompt:"",keywords:""});}}>إلغاء التعديل</button>}</div>
+            </form>
+          </section>
+          <section className="panel campaign-panel">
+            <div className="panel-head"><div><span className="eyebrow">SECRETARY DIRECTORY</span><h3>السكرتيرون المتاحون للتوجيه</h3></div></div>
+            <div className="campaign-list">{secretaries.map(s=><article className="campaign-row" key={s.id}>
+              <div><b>{s.name}{s.is_default ? " · الافتراضي" : ""}</b><small>{s.category} · {s.description}</small></div>
+              <div className="campaign-actions"><button type="button" onClick={()=>editSecretary(s)}>تعديل المعرفة</button>{!s.is_default && <button type="button" onClick={()=>deleteSecretary(s)}>حذف</button>}</div>
+            </article>)}</div>
+            {!secretaries.length && <div className="empty-state">لم يتم تحميل السكرتيرين بعد.</div>}
+          </section>
+          <div className="hint-panel"><span>ⓘ</span><p>التوجيه الذكي يختار من السكرتيرين المفعّلين فقط. التخصيص اليدوي للمحادثة يتقدم على تصنيف الذكاء الاصطناعي، والسكرتير المربوط بالحملة يتولى محادثات مستلميها. السكرتير العام بديل عند انخفاض الثقة.</p></div>
+        </div>}
+
+        {view === "assistant" && <div className="mf-content">
           <section className="panel assistant-panel">
             <div className="panel-head"><div><span className="eyebrow">AI CONFIGURATION</span><h3>إعدادات المساعد الذكي</h3></div><span className={assistant.enabled ? "state-pill" : "state-pill muted-state"}>{assistant.enabled ? "مفعّل" : "متوقف"}</span></div>
             <p className="muted">اختر محرك ذكاء اصطناعي يمكن استضافته ذاتيًا مثل Ollama أو vLLM عبر واجهة OpenAI-compatible، أو اربط مزودًا خارجيًا. مفتاح كل مساحة عمل يُخزّن مشفرًا.</p>
