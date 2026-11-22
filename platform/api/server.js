@@ -140,6 +140,19 @@ app.get('/health',async (req,res)=>{
   catch { res.status(503).json({ok:false,database:'unavailable'}); }
 });
 
+app.get('/health/whatsapp',async (req,res)=>{
+  const started=Date.now();
+  try {
+    const version=await waha('GET','/api/server/version');
+    return res.json({ok:true,gateway:'reachable',version:version?.version || version?.data?.version || version,durationMs:Date.now()-started});
+  } catch (error) {
+    const cause=error.cause || {};
+    const target=(()=>{try{return new URL(process.env.WAHA_URL).host;}catch{return 'not-configured';}})();
+    console.error('[WAHA health]',error.message,cause.code || '',cause.message || '');
+    return res.status(503).json({ok:false,gateway:'unreachable',target,error:error.message,cause:{name:cause.name || '',code:cause.code || '',message:cause.message || ''},durationMs:Date.now()-started});
+  }
+});
+
 /* Webhook route precedes express.json so signatures are checked against raw bytes. */
 app.post('/webhooks/waha',express.raw({type:'application/json',limit:'2mb'}),async (req,res)=>{
   const raw=Buffer.isBuffer(req.body)?req.body:Buffer.from('');
