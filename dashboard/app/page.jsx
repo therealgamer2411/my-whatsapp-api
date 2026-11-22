@@ -110,7 +110,13 @@ export default function Home() {
   const request = useCallback(async (route, options = {}) => {
     if (!base) throw new Error("أضف رابط خادم واتساب أولًا.");
     const headers = { ...(options.headers || {}) };
-    if (options.auth !== false && adminToken) headers.Authorization = "Bearer " + adminToken;
+    // HTTP headers are Latin-1 only. Encode the UTF-8 admin token before placing it in a header.
+    if (options.auth !== false && adminToken) {
+      const bytes = new TextEncoder().encode(adminToken);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+      headers.Authorization = "Bearer-UTF8 " + btoa(binary);
+    }
     if (options.body) headers["Content-Type"] = "application/json";
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 15000);
