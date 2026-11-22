@@ -320,6 +320,11 @@ app.post('/v1/conversations/:id/resume',auth,async (req,res)=>{
 });
 
 
+app.get('/v1/contacts',auth,async(req,res)=>{
+ const limit=Math.max(1,Math.min(5000,Number(req.query.limit||5000)));
+ const r=await pool.query('SELECT id,session_id,phone_number,display_name,marketing_opt_in,marketing_opt_in_at,marketing_opt_in_source FROM contacts WHERE workspace_id=$1 ORDER BY created_at DESC LIMIT $2',[req.actor.workspaceId,limit]);
+ res.json({contacts:r.rows});
+});
 app.post('/v1/contacts/import',auth,roles(['owner','admin']),async(req,res)=>{
  const sessionId=String(req.body?.sessionId||''), source=String(req.body?.consentSource||'').trim().slice(0,160);
  const phones=Array.isArray(req.body?.phones)?req.body.phones:[];
