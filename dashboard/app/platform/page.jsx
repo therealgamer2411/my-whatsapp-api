@@ -503,7 +503,7 @@ export default function PlatformPage() {
               <div className="chat-head"><b>{conversations.find((c) => c.id === activeContact)?.display_name || "محادثة العميل"}</b><span>{conversations.find((c) => c.id === activeContact)?.phone_number}</span></div>
               <div className="chat-messages">{messages.map((m) => <div key={m.id} className={"chat-bubble " + (m.direction === "outbound" ? "out" : "in")}><p>{m.body}</p><small>{new Date(m.sent_at).toLocaleString("ar-EG")}</small></div>)}</div>
               <form className="composer" onSubmit={sendMessage}><input value={messageDraft} onChange={(e) => setMessageDraft(e.target.value)} placeholder="اكتب رسالة للعميل..." /><button className="mf-primary" disabled={busy || !messageDraft.trim()}>إرسال</button></form>
-              <div className="takeover-row"><span>الرد الآلي متوقف لهذه المحادثة عند التدخل اليدوي.</span><button onClick={() => togglePause(activeContact, !conversations.find((c) => c.id === activeContact)?.is_paused)}>{conversations.find((c) => c.id === activeContact)?.is_paused ? "استئناف المساعد" : "إيقاف المساعد"}</button></div>
+              <div className="takeover-row"><span>{conversations.find((c) => c.id === activeContact)?.is_paused ? "المساعد متوقف لهذه المحادثة بسبب التدخل اليدوي." : "المساعد الذكي يعمل تلقائيًا على هذه المحادثة."}</span><button type="button" onClick={() => togglePause(activeContact, !conversations.find((c) => c.id === activeContact)?.is_paused)}>{conversations.find((c) => c.id === activeContact)?.is_paused ? "استئناف المساعد" : "إيقاف المساعد"}</button></div>
             </>}
           </section>
         </div>}
