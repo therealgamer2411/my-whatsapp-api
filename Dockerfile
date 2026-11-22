@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     ca-certificates \
     dumb-init \
+    gosu \
     curl \
     fonts-liberation \
     fonts-noto-core \
@@ -57,6 +58,6 @@ ENV NODE_ENV=production \
 
 EXPOSE 3000
 
-USER node
+USER root
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["node", "index.js"]
+CMD ["sh", "-c", "mkdir -p /app/persist/data /app/persist/.wwebjs_auth && chown -R node:node /app/persist && exec gosu node node index.js"]
