@@ -320,6 +320,28 @@ app.post('/v1/conversations/:id/resume',auth,async (req,res)=>{
 });
 
 
+app.post('/v1/contacts/import',auth,roles(['owner','admin']),async(req,res)=>{
+ const sessionId=String(req.body?.sessionId||''), source=String(req.body?.consentSource||'').trim().slice(0,160);
+ const phones=Array.isArray(req.body?.phones)?req.body.phones:[];
+ if(req.body?.confirmOptIn!==true||source.length<3)return res.status(400).json({error:'يلزم تأكيد الموافقة وتحديد مصدرها.'});
+ if(!phones.length||phones.length>5000)return res.status(400).json({error:'أدخل من 1 إلى 5000 رقم في كل عملية استيراد.'});
+ const session=await getSession(req.actor.workspaceId,sessionId);
+ if(!session||!['WORKING','CONNECTED'].includes(String(session.status).toUpperCase()))return res.status(400).json({error:'اختر رقم واتساب متصلًا.'});
+ const client=await pool.connect();let imported=0,invalid=0;
+ try{
+  await client.query('BEGIN');
+  for(const raw of phones){
+   const phone=String(raw||'').replace(/[^0-9]/g,'');
+   if(phone.length<8||phone.length>15){invalid++;continue;}
+   const chatId=phone+'@c.us';
+   await client.query("INSERT INTO contacts(id,workspace_id,session_id,chat_id,phone_number,display_name,marketing_opt_in,marketing_opt_in_at,marketing_opt_in_source) VALUES($1,$2,$3,$4,$5,$5,TRUE,NOW(),$6) ON CONFLICT(session_id,chat_id) DO UPDATE SET marketing_opt_in=TRUE,marketing_opt_in_at=NOW(),marketing_opt_in_source=EXCLUDED.marketing_opt_in_source",
+    [newId(),req.actor.workspaceId,sessionId,chatId,phone,source]);
+   imported++;
+  }
+  await client.query('COMMIT');res.status(201).json({ok:true,imported,invalid});
+ }catch(e){await client.query('ROLLBACK');console.error('[Contact import]',e.message);res.status(500).json({error:'تعذر استيراد جهات الاتصال.'});}
+ finally{client.release();}
+});
 app.patch('/v1/contacts/:id/marketing-consent',auth,roles(['owner','admin']),async (req,res)=>{
  const enabled=req.body?.enabled===true, source=String(req.body?.source||'').trim().slice(0,160);
  const r=await pool.query('UPDATE contacts SET marketing_opt_in=$1,marketing_opt_in_at=CASE WHEN $1 THEN NOW() ELSE NULL END,marketing_opt_in_source=$2 WHERE id=$3 AND workspace_id=$4 RETURNING id,phone_number,marketing_opt_in,marketing_opt_in_at',[enabled,enabled?source:'',req.params.id,req.actor.workspaceId]);
@@ -365,11 +387,13 @@ app.post('/v1/campaigns',auth,roles(['owner','admin']),async (req,res)=>{
  if(!title||!body||body.length>4000)return res.status(400).json({error:'أدخل اسم الحملة ورسالة صحيحة لا تتجاوز 4000 حرف.'});
  if(req.body?.confirmOptIn!==true)return res.status(400).json({error:'أكد أن جميع المستلمين وافقوا صراحةً على استقبال الرسائل.'});
  const ids=Array.isArray(req.body?.contactIds)?[...new Set(req.body.contactIds.map(String))].slice(0,5000):[];
- if(!ids.length)return res.status(400).json({error:'حدد جهات اتصال لديها موافقة تسويقية مسجلة.'});
+ if(req.body?.allOptedIn!==true&&!ids.length)return res.status(400).json({error:'حدد جهات اتصال لديها موافقة تسويقية مسجلة.'});
  const client=await pool.connect(), id=newId();
  try{
   await client.query('BEGIN');
-  const recipients=await client.query("SELECT c.id,c.session_id FROM contacts c JOIN wa_sessions s ON s.id=c.session_id WHERE c.workspace_id=$1 AND c.id=ANY($2::uuid[]) AND c.marketing_opt_in=TRUE AND s.status IN ('WORKING','CONNECTED')",[req.actor.workspaceId,ids]);
+  const recipients=req.body?.allOptedIn===true
+   ? await client.query("SELECT c.id,c.session_id FROM contacts c JOIN wa_sessions s ON s.id=c.session_id WHERE c.workspace_id=$1 AND c.marketing_opt_in=TRUE AND s.status IN ('WORKING','CONNECTED') ORDER BY c.created_at LIMIT 5000",[req.actor.workspaceId])
+   : await client.query("SELECT c.id,c.session_id FROM contacts c JOIN wa_sessions s ON s.id=c.session_id WHERE c.workspace_id=$1 AND c.id=ANY($2::uuid[]) AND c.marketing_opt_in=TRUE AND s.status IN ('WORKING','CONNECTED')",[req.actor.workspaceId,ids]);
   if(!recipients.rowCount){await client.query('ROLLBACK');return res.status(400).json({error:'لا توجد جهات اتصال مؤهلة: يلزم تسجيل الموافقة وربط رقم متصل.'});}
   await client.query("INSERT INTO campaigns(id,workspace_id,title,body,status,delay_ms,total_count) VALUES($1,$2,$3,$4,'queued',$5,$6)",[id,req.actor.workspaceId,title,body,delay,recipients.rowCount]);
   for(const row of recipients.rows)await client.query("INSERT INTO campaign_recipients(id,campaign_id,workspace_id,contact_id,session_id) VALUES($1,$2,$3,$4,$5)",[newId(),id,req.actor.workspaceId,row.id,row.session_id]);
