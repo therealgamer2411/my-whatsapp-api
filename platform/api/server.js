@@ -98,23 +98,65 @@ async function aiCompletion(settings,history) {
   for (const row of history) messages.push({role:row.direction==='inbound'?'user':'assistant',content:row.body});
   if (settings.provider==='gemini') {
     const key=decrypt(settings.api_key_ciphertext);
-    const configuredModel=String(settings.model || 'gemini-3.8-flash').replace(/^models\//,'');
-    const model=['gemini-2.5-flash','gemini-2.5-flash-latest'].includes(configuredModel)?'gemini-3.8-flash':configuredModel;
-    const response=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({systemInstruction:{parts:[{text:settings.system_prompt}]},contents,generationConfig:{temperature:0.4,maxOutputTokens:700}}),
-      signal:AbortSignal.timeout(45000)
-    });
-    const data=await response.json().catch(()=>({}));
-    if (!response.ok) throw new Error(data.error?.message || 'Gemini request failed.');
-    return String(data.candidates?.[0]?.content?.parts?.map(p=>p.text || '').join('') || '').trim();
+    if (!key) throw new Error('Gemini API key is missing.');
+    const configured=String(settings.model || 'gemini-3.8-flash').replace(/^models\//,'');
+    const api='https://generativelanguage.googleapis.com/v1beta';
+    let discovered=[];
+    try {
+      const listResponse=await fetch(api+'/models?pageSize=1000&key='+encodeURIComponent(key),{signal:AbortSignal.timeout(12000)});
+      const listData=await listResponse.json().catch(()=>({}));
+      if (listResponse.ok && Array.isArray(listData.models)) {
+        discovered=listData.models
+          .filter(m=>String(m.name||'').startsWith('models/gemini') && (m.supportedGenerationMethods||[]).includes('generateContent'))
+          .map(m=>String(m.name).replace(/^models\//,''));
+      } else {
+        console.warn('[Gemini model discovery]',listData.error?.message || ('HTTP '+listResponse.status));
+      }
+    } catch(e) { console.warn('[Gemini model discovery]',e.message); }
+    const preferred=[configured,'gemini-3.8-flash','gemini-3.1-flash-lite','gemini-2.5-flash','gemini-2.5-flash-lite'];
+    const ordered=[...new Set([...preferred,...discovered])].filter(Boolean);
+    const available=discovered.length?ordered.filter(m=>preferred.includes(m)||discovered.includes(m)):ordered;
+    const contents=history.map(row=>({role:row.direction==='inbound'?'user':'model',parts:[{text:String(row.body||'')}]})).filter(x=>x.parts[0].text);
+    if (!contents.length) throw new Error('No conversation content to send to Gemini.');
+    const failures=[];
+    for (const model of available) {
+      try {
+        const response=await fetch(api+'/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({
+            systemInstruction:{parts:[{text:String(settings.system_prompt||'أنت مساعد خدمة عملاء محترف. أجب بناءً على معلومات المنتج المتاحة ولا تخترع بيانات.')} ]},
+            contents,
+            generationConfig:{temperature:0.4,maxOutputTokens:900}
+          }),
+          signal:AbortSignal.timeout(22000)
+        });
+        const data=await response.json().catch(()=>({}));
+        if (!response.ok) {
+          const reason=String(data.error?.message||('HTTP '+response.status));
+          failures.push(model+': '+reason);
+          console.warn('[Gemini model failed]',model,reason);
+          if ([400,401,403].includes(response.status) && /API_KEY_INVALID|API key not valid|permission|leaked/i.test(reason)) break;
+          continue;
+        }
+        const answer=String(data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'').trim();
+        if (answer) {
+          console.log('[Gemini model selected]',model);
+          return answer;
+        }
+        failures.push(model+': empty response');
+      } catch(e) {
+        failures.push(model+': '+e.message);
+        console.warn('[Gemini model failed]',model,e.message);
+      }
+    }
+    throw new Error('All compatible Gemini models failed: '+failures.slice(0,8).join(' | ').slice(0,1200));
   }
   const base=String(settings.base_url || '').replace(/\/+$/,''), model=String(settings.model || '');
   if (!base || !model) throw new Error('أدخل عنوان محرك الذكاء الاصطناعي واسم النموذج.');
   const key=decrypt(settings.api_key_ciphertext);
   const response=await fetch(base+'/chat/completions',{
     method:'POST',headers:Object.assign({'Content-Type':'application/json'},key?{Authorization:'Bearer '+key}:{}),
-    body:JSON.stringify({model,messages,temperature:0.4,max_tokens:700}),signal:AbortSignal.timeout(60000)
+    body:JSON.stringify({model,messages,temperature:0.4,max_tokens:900}),signal:AbortSignal.timeout(60000)
   });
   const data=await response.json().catch(()=>({}));
   if (!response.ok) throw new Error(data.error?.message || 'AI provider request failed.');
