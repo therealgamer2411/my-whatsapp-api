@@ -266,6 +266,50 @@ app.get('/v1/whatsapp/sessions/:id',auth,async (req,res)=>{
     res.json({id:row.id,label:row.label,status,phoneNumber:phone,engine:remote?.engine?.engine || row.engine});
   } catch(e) { res.status(502).json({error:'تعذر قراءة حالة الجلسة: '+e.message}); }
 });
+app.post('/v1/whatsapp/sessions/:id/sync',auth,async (req,res)=>{
+  const session=await getSession(req.actor.workspaceId,req.params.id);
+  if (!session) return res.status(404).json({error:'الجلسة غير موجودة.'});
+  if (!['WORKING','CONNECTED'].includes(String(session.status).toUpperCase())) return res.status(409).json({error:'يجب أن يكون واتساب متصلًا قبل مزامنة المحادثات.'});
+  const limit=Math.max(1,Math.min(100,Number(req.body?.limit)||100));
+  const offset=Math.max(0,Number(req.body?.offset)||0);
+  try {
+    const route='/api/'+encodeURIComponent(session.waha_name)+'/chats/overview?limit='+limit+'&offset='+offset;
+    const remote=await waha('GET',route);
+    const chats=Array.isArray(remote)?remote:(remote?.chats || remote?.data || []);
+    let imported=0, messagesImported=0;
+    const client=await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const chat of chats) {
+        const chatId=String(chat?.id || chat?.chatId || '');
+        if (!chatId || chatId==='status@broadcast' || chatId.endsWith('@newsletter')) continue;
+        const last=chat.lastMessage || null;
+        const contact=await upsertContact(client,session,chatId,chat.name || chat.pushName || last?.pushName || 'عميل');
+        if (last) {
+          const body=String(last.body || last.caption || (last.hasMedia ? '[مرفق]' : '')).trim();
+          const rawId=last.id;
+          const wamid=typeof rawId==='string'?rawId:(rawId?._serialized || rawId?.id || 'sync-'+String(last.timestamp || Date.now())+'-'+chatId);
+          if (body) {
+            const timestamp=Number(last.timestamp);
+            const sentAt=Number.isFinite(timestamp)&&timestamp>0?new Date(timestamp*1000):new Date();
+            const saved=await client.query(
+              "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(session_id,wamid) DO NOTHING RETURNING id",
+              [newId(),session.workspace_id,session.id,contact.id,String(wamid),last.fromMe?'outbound':'inbound',String(last.type || (last.hasMedia?'media':'text')),body,last.fromMe?'sent':'received',sentAt]);
+            if (saved.rowCount) messagesImported++;
+          }
+        }
+        imported++;
+      }
+      await client.query('COMMIT');
+    } catch(e) { await client.query('ROLLBACK'); throw e; }
+    finally { client.release(); }
+    res.json({ok:true,imported,messagesImported,offset,nextOffset:offset+chats.length,hasMore:chats.length===limit});
+  } catch(e) {
+    console.error('[Chat sync]',e.message);
+    res.status(502).json({error:'تعذرت مزامنة محادثات واتساب: '+e.message});
+  }
+});
+
 app.get('/v1/whatsapp/sessions/:id/qr',auth,async (req,res)=>{
   const row=await getSession(req.actor.workspaceId,req.params.id);
   if (!row) return res.status(404).json({error:'الجلسة غير موجودة.'});
@@ -299,6 +343,28 @@ app.get('/v1/conversations',auth,async (req,res)=>{
 app.get('/v1/conversations/:id/messages',auth,async (req,res)=>{
   const c=await getContact(req.actor.workspaceId,req.params.id);
   if (!c) return res.status(404).json({error:'المحادثة غير موجودة.'});
+  if (req.query.sync==='1') {
+    try {
+      const route='/api/'+encodeURIComponent(c.waha_name)+'/chats/'+encodeURIComponent(c.chat_id)+'/messages?limit=100&downloadMedia=false';
+      const remote=await waha('GET',route), rows=Array.isArray(remote)?remote:(remote?.messages || remote?.data || []);
+      const client=await pool.connect();
+      try {
+        await client.query('BEGIN');
+        for (const msg of rows) {
+          const body=String(msg.body || msg.caption || (msg.hasMedia?'[مرفق]':'')).trim();
+          if (!body) continue;
+          const rawId=msg.id, wamid=typeof rawId==='string'?rawId:(rawId?._serialized || rawId?.id || 'sync-'+String(msg.timestamp || Date.now())+'-'+c.chat_id);
+          const timestamp=Number(msg.timestamp), sentAt=Number.isFinite(timestamp)&&timestamp>0?new Date(timestamp*1000):new Date();
+          await client.query(
+            "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(session_id,wamid) DO NOTHING",
+            [newId(),c.workspace_id,c.session_id,c.id,String(wamid),msg.fromMe?'outbound':'inbound',String(msg.type || (msg.hasMedia?'media':'text')),body,msg.fromMe?'sent':'received',sentAt]);
+        }
+        await client.query('UPDATE contacts SET last_message_at=COALESCE((SELECT MAX(sent_at) FROM messages WHERE contact_id=$1),last_message_at) WHERE id=$1',[c.id]);
+        await client.query('COMMIT');
+      } catch(e) { await client.query('ROLLBACK'); throw e; }
+      finally { client.release(); }
+    } catch(e) { console.error('[Message history sync]',e.message); }
+  }
   const r=await pool.query('SELECT id,direction,message_type,body,status,sent_at FROM messages WHERE contact_id=$1 ORDER BY sent_at ASC LIMIT 500',[c.id]);
   res.json({contact:{id:c.id,name:c.display_name,phoneNumber:c.phone_number,isPaused:c.is_paused},messages:r.rows});
 });
