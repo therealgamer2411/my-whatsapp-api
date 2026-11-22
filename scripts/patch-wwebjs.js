@@ -87,8 +87,8 @@ function patchClient() {
 
   source = replaceExactlyOnce(
     source,
-    '        this.lastLoggedOut = false;\n',
-    '        this.lastLoggedOut = false;\n\n        // MF_PATCH_SERIALIZED_INJECT_QUEUE: serialize reinjection for this page.\n        this._injectQueue = Promise.resolve();\n',
+    '        this.currentIndexHtml = null;\n        this.lastLoggedOut = false;\n',
+    '        this.currentIndexHtml = null;\n        this.lastLoggedOut = false;\n\n        // MF_PATCH_SERIALIZED_INJECT_QUEUE: serialize reinjection for this page.\n        this._injectQueue = Promise.resolve();\n',
     'client injection queue field'
   );
 
