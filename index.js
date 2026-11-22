@@ -250,6 +250,15 @@ client.on('qr', (qr) => {
   console.log('\nامسح QR من واتساب: الأجهزة المرتبطة ← ربط جهاز');
   qrcode.generate(qr, { small: true });
 });
+client.on('loading_screen', (percent, message) => {
+  console.log('[WhatsApp] Loading ' + percent + '% ' + String(message || ''));
+});
+client.on('change_state', (state) => {
+  console.log('[WhatsApp] State changed: ' + String(state));
+});
+client.on('inject_error', (error) => {
+  console.error('[WhatsApp] Injection error:', error && (error.stack || error.message) || String(error));
+});
 client.on('authenticated', () => console.log('[WhatsApp] Authentication successful.'));
 client.on('ready', () => {
   latestQr = null;
