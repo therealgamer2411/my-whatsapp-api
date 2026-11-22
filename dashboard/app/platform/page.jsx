@@ -34,6 +34,7 @@ export default function PlatformPage() {
     has_api_key: false
   });
   const [campaigns, setCampaigns] = useState([]);
+  const [campaignContacts, setCampaignContacts] = useState([]);
   const [campaignTitle, setCampaignTitle] = useState("");
   const [campaignBody, setCampaignBody] = useState("");
   const [campaignDelay, setCampaignDelay] = useState(10000);
@@ -167,8 +168,8 @@ export default function PlatformPage() {
     let active = true;
     const load = async () => {
       try {
-        const [c, contacts] = await Promise.all([request("/v1/campaigns"), request("/v1/conversations")]);
-        if (active) { setCampaigns(c.campaigns || []); setConversations(contacts.conversations || []); }
+        const [c, contacts, directory] = await Promise.all([request("/v1/campaigns"), request("/v1/conversations"), request("/v1/contacts?limit=5000")]);
+        if (active) { setCampaigns(c.campaigns || []); setConversations(contacts.conversations || []); setCampaignContacts(directory.contacts || []); }
       } catch (e) { if (active) flash(e.message, true); }
     };
     load();
@@ -240,6 +241,7 @@ export default function PlatformPage() {
         method: "PATCH", body: JSON.stringify({ enabled, source: enabled ? "confirmed-in-dashboard" : "" })
       });
       setConversations(old => old.map(c => c.id === contact.id ? { ...c, marketing_opt_in: enabled } : c));
+      setCampaignContacts(old => old.map(c => c.id === contact.id ? { ...c, marketing_opt_in: enabled } : c));
       flash(enabled ? "تم تسجيل موافقة جهة الاتصال." : "تم سحب الموافقة.");
     } catch (e) { flash(e.message, true); }
   }
@@ -460,7 +462,7 @@ export default function PlatformPage() {
 
         {view === "campaigns" && <div className="mf-content">
           <section className="panel campaign-panel">
-            <div className="panel-head"><div><span className="eyebrow">CONSENT-BASED OUTREACH</span><h3>إنشاء حملة رسائل موحدة</h3></div><span className="count-badge">{conversations.filter(c => c.marketing_opt_in).length} موافق</span></div>
+            <div className="panel-head"><div><span className="eyebrow">CONSENT-BASED OUTREACH</span><h3>إنشاء حملة رسائل موحدة</h3></div><span className="count-badge">{campaignContacts.filter(c => c.marketing_opt_in).length} موافق</span></div>
             <p className="muted">تُرسل الرسالة نفسها فقط لجهات الاتصال التي سجلت موافقتها. الإرسال متدرج، ويمكن إيقاف الحملة. أي خطأ من مزود واتساب يوقف الحملة تلقائيًا.</p>
             <form className="mf-form" onSubmit={createCampaign}>
               <label>اسم الحملة<input required value={campaignTitle} onChange={e=>setCampaignTitle(e.target.value)} placeholder="مثال: عرض نهاية الشهر"/></label>
@@ -473,7 +475,7 @@ export default function PlatformPage() {
           <section className="panel campaign-panel">
             <div className="panel-head"><div><span className="eyebrow">CONTACT PERMISSIONS</span><h3>إدارة موافقات جهات الاتصال</h3></div></div>
             <div className="consent-list">
-              {conversations.map(c=><div className="consent-row" key={c.id}>
+              {campaignContacts.map(c=><div className="consent-row" key={c.id}>
                 <div><b>{c.display_name}</b><small dir="ltr">{c.phone_number}</small></div>
                 <label><input type="checkbox" checked={Boolean(c.marketing_opt_in)} onChange={e=>setMarketingConsent(c,e.target.checked)}/> موافق على الرسائل</label>
               </div>)}
