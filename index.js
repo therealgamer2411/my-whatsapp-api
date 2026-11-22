@@ -7,7 +7,7 @@ const express = require('express');
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { state, conversation, addMessage, seen, markSeen, addLead, save, flush } = require('./store');
-const { getDecision, normalizePhone, handoffMessage } = require('./secretary');
+const { getDecision, normalizePhone, handoffMessage, explicitHandoff } = require('./secretary');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -108,7 +108,7 @@ async function processMessage(message) {
   } catch (error) {
     console.error('[AI] Request failed:', error.message);
     decision = {
-      handoff: false,
+      handoff: explicitHandoff(body),
       reply: 'أعتذر لحضرتك، حصلت مشكلة مؤقتة أثناء تجهيز الرد. ممكن توضح لي طلبك في رسالة مختصرة؟',
       lead_summary: body,
       reason: 'AI_ERROR'
