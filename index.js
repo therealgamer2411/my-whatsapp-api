@@ -515,7 +515,14 @@ async function runAiStartupDiagnostics() {
   }
 
   const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-  for (const url of ['https://www.google.com/generate_204', 'https://web.whatsapp.com']) {
+  try {
+    const dns = require('node:dns').promises;
+    const records = await dns.lookup('generativelanguage.googleapis.com', { all: true });
+    console.log('[AI Diagnostics] GEMINI_DNS_OK addresses=' + records.map(x => x.address).join(','));
+  } catch (error) {
+    console.error('[AI Diagnostics] GEMINI_DNS_FAILED: ' + String(error.message || error).slice(0, 300));
+  }
+  for (const url of ['https://www.google.com/generate_204', 'https://web.whatsapp.com', 'https://generativelanguage.googleapis.com/v1beta/models']) {
     const host = new URL(url).hostname;
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'manual' });
@@ -545,6 +552,7 @@ async function runAiStartupDiagnostics() {
     console.error('[AI Diagnostics] REST_TEXT_FAILED: ' + String(error.message || error).slice(0, 650));
   }
 
+  console.log('[AI Diagnostics] CHAT_LOGIC_START');
   try {
     const decision = await getDecision('السلام عليكم، ممكن أعرف خدماتكم؟', []);
     if (!decision || !String(decision.reply || '').trim()) throw new Error('Assistant returned an empty reply.');
@@ -553,6 +561,7 @@ async function runAiStartupDiagnostics() {
     console.error('[AI Diagnostics] CHAT_LOGIC_FAILED: ' + String(error.message || error).slice(0, 500));
   }
 
+  console.log('[AI Diagnostics] TTS_START');
   let audio;
   try {
     audio = await synthesizeVoiceNote('ده اختبار صوتي قصير للسكرتير الذكي.');
@@ -562,6 +571,7 @@ async function runAiStartupDiagnostics() {
     return;
   }
 
+  console.log('[AI Diagnostics] STT_START');
   try {
     const transcript = await transcribeAudio({
       data: audio.toString('base64'),
