@@ -504,14 +504,17 @@ app.post('/webhooks/waha',express.raw({type:'application/json',limit:'2mb'}),asy
   } finally { client.release(); }
   res.status(200).json({ok:true,voiceQueued:isVoice});
   if (isVoice && messageRowId) {
-    const current=(await pool.query('SELECT transcription_status FROM messages WHERE id=$1',[messageRowId])).rows[0];
-    if (current?.transcription_status!=='completed') {
-      setImmediate(()=>processIncomingVoice(session,contact,messageRowId,p).catch(e=>console.error('[Voice worker]',e.message)));
-    }
+    setImmediate(async()=>{
+      try {
+        const current=(await pool.query('SELECT transcription_status FROM messages WHERE id=$1',[messageRowId])).rows[0];
+        if (current?.transcription_status!=='completed') await processIncomingVoice(session,contact,messageRowId,p);
+      } catch(e) { console.error('[Voice worker]',e.message); }
+    });
   } else if (wasInserted) {
     setImmediate(()=>assistantReply(session,contact).catch(e=>console.error('[Assistant]',e.message)));
   }
-  
+});
+
 app.use(express.json({limit:'1mb'}));
 app.use('/v1/auth',rate);
 
