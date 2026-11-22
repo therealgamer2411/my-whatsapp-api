@@ -35,3 +35,11 @@ CREATE TABLE IF NOT EXISTS campaign_recipients (
 );
 CREATE INDEX IF NOT EXISTS campaign_recipients_queue_idx ON campaign_recipients(campaign_id,status);
 CREATE INDEX IF NOT EXISTS campaigns_workspace_idx ON campaigns(workspace_id,created_at DESC);
+
+
+-- Auditable per-recipient reference and exact outbound payload for campaigns.
+CREATE SEQUENCE IF NOT EXISTS message_reference_seq START 1;
+ALTER TABLE campaign_recipients ADD COLUMN IF NOT EXISTS reference_code TEXT;
+ALTER TABLE campaign_recipients ADD COLUMN IF NOT EXISTS sent_body TEXT NOT NULL DEFAULT '';
+ALTER TABLE campaign_recipients ADD COLUMN IF NOT EXISTS provider_message_id TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS campaign_recipients_reference_code_uq ON campaign_recipients(reference_code) WHERE reference_code IS NOT NULL;
