@@ -3,8 +3,11 @@
 require('dotenv').config();
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const express = require('express');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const { state, conversation, addMessage, seen, markSeen, addLead, save, flush } = require('./store');
 const { getDecision, normalizePhone, handoffMessage, explicitHandoff } = require('./secretary');
@@ -13,13 +16,14 @@ const { transcribeAudio, synthesizeVoiceNote } = require('./voice');
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
-const AUTO_REPLY = String(process.env.AUTO_REPLY_ENABLED || 'false').toLowerCase() === 'true';
+let autoReply = String(process.env.AUTO_REPLY_ENABLED || 'false').toLowerCase() === 'true';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const MANAGER_NAME = process.env.MANAGER_NAME || 'المستشار أحمد';
 const MANAGER_ROLE = process.env.MANAGER_ROLE || 'مدير متابعة العملاء';
 const TAKEOVER_MINUTES = Math.max(5, Number(process.env.MANUAL_TAKEOVER_MINUTES || 120));
 
 let ready = false;
+let latestQr = null;
 const queues = new Map();
 const botOutbox = new Map();
 
@@ -99,7 +103,7 @@ async function customerName(message) {
 }
 
 async function processMessage(message) {
-  if (!AUTO_REPLY || !ready || !message || message.fromMe || message.isGroupMsg) return;
+  if (!autoReply || !ready || !message || message.fromMe || message.isGroupMsg) return;
   const chatId = message.from;
   if (!chatId || String(chatId).endsWith('@g.us') || chatId === 'status@broadcast') return;
   if (!String(chatId).endsWith('@c.us') && !String(chatId).endsWith('@lid')) return;
@@ -241,9 +245,10 @@ client.on('qr', (qr) => {
 });
 client.on('authenticated', () => console.log('[WhatsApp] Authentication successful.'));
 client.on('ready', () => {
+  latestQr = null;
   ready = true;
   console.log('[WhatsApp] Connected and ready.');
-  console.log('[Secretary] Auto replies: ' + (AUTO_REPLY ? 'ON' : 'OFF'));
+  console.log('[Secretary] Auto replies: ' + (autoReply ? 'ON' : 'OFF'));
 });
 client.on('auth_failure', (message) => {
   ready = false;
@@ -289,13 +294,32 @@ client.on('message_create', (message) => {
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 
+const allowedDashboardOrigins = String(process.env.DASHBOARD_ORIGINS || '')
+  .split(',')
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && allowedDashboardOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Max-Age', '600');
+  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
     whatsapp: ready ? 'ready' : 'disconnected',
     aiConfigured: Boolean(process.env.GEMINI_API_KEY),
     managerConfigured: Boolean(normalizePhone(process.env.MANAGER_PHONE || '')),
-    automaticReplies: AUTO_REPLY,
+    automaticReplies: autoReply,
     voiceReplies: process.env.VOICE_REPLY_MODE || 'mirror',
     voiceModelConfigured: Boolean(process.env.GEMINI_API_KEY),
     timestamp: new Date().toISOString()
@@ -318,6 +342,107 @@ app.get('/admin/conversations', adminOnly, (req, res) => {
 app.get('/admin/leads', adminOnly, (req, res) => {
   res.json({ leads: state.leads.slice(-100).reverse() });
 });
+
+app.get('/admin/qr', adminOnly, async (req, res) => {
+  if (ready) return res.json({ connected: true, qr: null });
+  if (!latestQr) return res.status(202).json({ connected: false, qr: null, waiting: true });
+  try {
+    const dataUrl = await QRCode.toDataURL(latestQr, { errorCorrectionLevel: 'M', margin: 2, width: 280 });
+    return res.json({ connected: false, qr: dataUrl, waiting: false });
+  } catch (error) {
+    return res.status(500).json({ error: 'Could not render QR code.' });
+  }
+});
+
+const SETTINGS_KEYS = new Set([
+  'GEMINI_API_KEY',
+  'GEMINI_MODEL',
+  'GEMINI_AUDIO_MODEL',
+  'GEMINI_TTS_MODEL',
+  'GEMINI_TTS_VOICE',
+  'GEMINI_TTS_STYLE',
+  'VOICE_REPLY_MODE',
+  'VOICE_REPLY_INCLUDE_TEXT',
+  'MANAGER_NAME',
+  'MANAGER_ROLE',
+  'MANAGER_PHONE',
+  'AUTO_REPLY_ENABLED',
+  'MAX_INCOMING_AUDIO_BYTES',
+  'MAX_VOICE_REPLY_CHARS',
+  'VOICE_BITRATE'
+]);
+
+function serializeEnvValue(value) {
+  return '"' + String(value ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, '\\n') + '"';
+}
+
+app.get('/admin/settings', adminOnly, (req, res) => {
+  res.json({
+    settings: {
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      geminiModel: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+      audioModel: process.env.GEMINI_AUDIO_MODEL || 'gemini-3.5-transcribe',
+      ttsModel: process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-tts',
+      ttsVoice: process.env.GEMINI_TTS_VOICE || 'Kore',
+      voiceReplyMode: process.env.VOICE_REPLY_MODE || 'mirror',
+      voiceReplyIncludeText: String(process.env.VOICE_REPLY_INCLUDE_TEXT || 'false') === 'true',
+      managerName: process.env.MANAGER_NAME || 'المستشار أحمد',
+      managerRole: process.env.MANAGER_ROLE || 'مدير متابعة العملاء',
+      managerPhone: process.env.MANAGER_PHONE || '',
+      autoReplyEnabled: autoReply
+    }
+  });
+});
+
+app.post('/admin/settings', adminOnly, (req, res) => {
+  const incoming = req.body && req.body.settings;
+  if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+    return res.status(400).json({ error: 'Provide a settings object.' });
+  }
+
+  const updates = {};
+  for (const [key, raw] of Object.entries(incoming)) {
+    if (!SETTINGS_KEYS.has(key)) continue;
+    if (typeof raw !== 'string' && typeof raw !== 'boolean' && typeof raw !== 'number') continue;
+    const value = String(raw).trim();
+    if (value.length > 4000) return res.status(400).json({ error: 'A setting is too long: ' + key });
+    updates[key] = value;
+  }
+
+  if (updates.VOICE_REPLY_MODE && !['mirror', 'always', 'never'].includes(updates.VOICE_REPLY_MODE)) {
+    return res.status(400).json({ error: 'VOICE_REPLY_MODE must be mirror, always, or never.' });
+  }
+  if (updates.MANAGER_PHONE && !normalizePhone(updates.MANAGER_PHONE)) {
+    return res.status(400).json({ error: 'MANAGER_PHONE must be a valid international number.' });
+  }
+
+  try {
+    const envPath = path.resolve(process.env.ENV_FILE || '.env');
+    let current = {};
+    if (fs.existsSync(envPath)) {
+      current = require('dotenv').parse(fs.readFileSync(envPath));
+    }
+    const merged = { ...current, ...updates };
+    const output = Object.entries(merged).map(([key, value]) => key + '=' + serializeEnvValue(value)).join('\n') + '\n';
+    const tempPath = envPath + '.tmp';
+    fs.writeFileSync(tempPath, output, { mode: 0o600 });
+    fs.renameSync(tempPath, envPath);
+
+    for (const [key, value] of Object.entries(updates)) process.env[key] = value;
+    autoReply = String(process.env.AUTO_REPLY_ENABLED || 'false').toLowerCase() === 'true';
+
+    return res.json({
+      ok: true,
+      saved: Object.keys(updates).filter((key) => key !== 'GEMINI_API_KEY'),
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      automaticReplies: autoReply
+    });
+  } catch (error) {
+    console.error('[Settings] Could not persist settings:', error.message);
+    return res.status(500).json({ error: 'Settings could not be saved on the WhatsApp worker.' });
+  }
+});
+
 
 app.post('/admin/resume', adminOnly, (req, res) => {
   const phone = normalizePhone(req.body && req.body.phone);
@@ -368,7 +493,7 @@ app.listen(PORT, HOST, () => {
   if (!ADMIN_TOKEN) console.warn('[Security] ADMIN_TOKEN missing; admin routes disabled.');
   if (!process.env.GEMINI_API_KEY) console.warn('[AI] GEMINI_API_KEY missing; only a fallback response is available.');
   if (!normalizePhone(process.env.MANAGER_PHONE || '')) console.warn('[Handoff] MANAGER_PHONE missing; configure it before live use.');
-  if (!AUTO_REPLY) console.log('[Secretary] AUTO_REPLY_ENABLED=false; no automatic replies will be sent.');
+  if (!autoReply) console.log('[Secretary] AUTO_REPLY_ENABLED=false; no automatic replies will be sent.');
 });
 
 client.initialize().catch((error) => {
