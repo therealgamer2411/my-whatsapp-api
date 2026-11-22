@@ -5,9 +5,10 @@ require('dotenv').config();
 const crypto = require('node:crypto');
 const express = require('express');
 const qrcode = require('qrcode-terminal');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const { state, conversation, addMessage, seen, markSeen, addLead, save, flush } = require('./store');
 const { getDecision, normalizePhone, handoffMessage, explicitHandoff } = require('./secretary');
+const { transcribeAudio, synthesizeVoiceNote } = require('./voice');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -32,6 +33,35 @@ async function sendBotMessage(chatId, text) {
   if (!body) throw new Error('Message is empty.');
   botOutbox.set(fingerprint(chatId, body), Date.now() + 120000);
   return client.sendMessage(chatId, body);
+}
+
+async function sendBotVoiceNote(chatId, oggBuffer) {
+  if (!ready) throw new Error('WhatsApp is not connected.');
+  if (!Buffer.isBuffer(oggBuffer) || oggBuffer.length < 100) {
+    throw new Error('Voice-note audio is empty or invalid.');
+  }
+  const media = new MessageMedia('audio/ogg', oggBuffer.toString('base64'), 'secretary-reply.ogg');
+  botOutbox.set(fingerprint(chatId, '[voice-note]'), Date.now() + 120000);
+  return client.sendMessage(chatId, media, { sendAudioAsVoice: true, sendSeen: true });
+}
+
+async function sendAssistantReply(chatId, text, incomingWasVoice) {
+  const mode = String(process.env.VOICE_REPLY_MODE || 'mirror').toLowerCase();
+  const useVoice = mode === 'always' || (mode === 'mirror' && incomingWasVoice);
+  if (useVoice) {
+    try {
+      const audio = await synthesizeVoiceNote(text);
+      await sendBotVoiceNote(chatId, audio);
+      if (String(process.env.VOICE_REPLY_INCLUDE_TEXT || 'false').toLowerCase() === 'true') {
+        await sendBotMessage(chatId, text);
+      }
+      return { mode: 'voice' };
+    } catch (error) {
+      console.error('[Voice] Generation or send failed; falling back to text:', error.message);
+    }
+  }
+  await sendBotMessage(chatId, text);
+  return { mode: 'text' };
 }
 
 function safeTokenEqual(a, b) {
@@ -77,7 +107,8 @@ async function processMessage(message) {
   if (seen(messageId)) return;
   markSeen(messageId);
 
-  const body = String(message.body || message.caption || '').trim();
+  const incomingWasVoice = ['ptt', 'audio'].includes(String(message.type || '').toLowerCase());
+  let body = String(message.body || message.caption || '').trim();
   const current = conversation(chatId);
 
   if (current.paused || current.handedOff) {
@@ -92,14 +123,29 @@ async function processMessage(message) {
     }
   }
 
+  if (incomingWasVoice) {
+    try {
+      const media = await message.downloadMedia();
+      body = await transcribeAudio(media);
+      if (!body) throw new Error('The voice message did not contain recognizable speech.');
+      console.log('[Voice] Incoming audio transcribed for ' + chatId);
+    } catch (error) {
+      console.error('[Voice] Transcription failed:', error.message);
+      const retry = 'وصلتني الرسالة الصوتية، لكن لم أتمكن من فهمها بوضوح. ممكن حضرتك تعيد إرسالها أو تكتب لي المطلوب في رسالة؟';
+      await sendBotMessage(chatId, retry);
+      addMessage(chatId, 'assistant', retry);
+      return;
+    }
+  }
+
   if (!body) {
-    const answer = 'وصلني مرفق من حضرتك. النسخة الحالية تتعامل مع الرسائل النصية؛ ممكن تكتب لي المطلوب في رسالة؟';
+    const answer = 'وصلني مرفق من حضرتك. ممكن تكتب لي المطلوب في رسالة نصية أو تبعت رسالة صوتية؟';
     await sendBotMessage(chatId, answer);
     addMessage(chatId, 'assistant', answer);
     return;
   }
 
-  addMessage(chatId, 'user', body);
+  addMessage(chatId, 'user', incomingWasVoice ? '[رسالة صوتية مفرغة]: ' + body : body);
   current.customerName = current.customerName || await customerName(message);
 
   let decision;
@@ -138,7 +184,7 @@ async function processMessage(message) {
     });
 
     const answer = handoffMessage(MANAGER_NAME, MANAGER_ROLE, managerPhone);
-    await sendBotMessage(chatId, answer);
+    await sendAssistantReply(chatId, answer, incomingWasVoice);
     addMessage(chatId, 'assistant', answer);
 
     if (managerPhone) {
@@ -163,7 +209,7 @@ async function processMessage(message) {
   }
 
   const answer = decision.reply || 'شكرًا لتواصلك. ممكن توضح لي تفاصيل أكثر عن طلب حضرتك؟';
-  await sendBotMessage(chatId, answer);
+  await sendAssistantReply(chatId, answer, incomingWasVoice);
   addMessage(chatId, 'assistant', answer);
 }
 
@@ -218,7 +264,8 @@ client.on('message_create', (message) => {
   if (!message || !message.fromMe || !message.to) return;
   const chatId = message.to;
   if (String(chatId).endsWith('@g.us')) return;
-  const key = fingerprint(chatId, message.body || '');
+  const outgoingBody = message.body || (['ptt', 'audio'].includes(String(message.type || '').toLowerCase()) ? '[voice-note]' : '');
+  const key = fingerprint(chatId, outgoingBody);
   const expires = botOutbox.get(key);
   if (expires && expires >= Date.now()) {
     botOutbox.delete(key);
@@ -245,6 +292,8 @@ app.get('/health', (req, res) => {
     aiConfigured: Boolean(process.env.GEMINI_API_KEY),
     managerConfigured: Boolean(normalizePhone(process.env.MANAGER_PHONE || '')),
     automaticReplies: AUTO_REPLY,
+    voiceReplies: process.env.VOICE_REPLY_MODE || 'mirror',
+    voiceModelConfigured: Boolean(process.env.GEMINI_API_KEY),
     timestamp: new Date().toISOString()
   });
 });
