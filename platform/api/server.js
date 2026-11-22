@@ -428,9 +428,14 @@ async function assistantReply(session,contact) {
     const history=mr.rows.reverse();
     const route=await resolveSecretary(session,contact,settings,history);
     const secretary=route.secretary;
+    const lastInboundMessage=[...history].reverse().find(message=>message.direction==='inbound');
+    const isReplyingToVoice=String(lastInboundMessage?.body || '').startsWith('🎤 رسالة صوتية:');
+    const voiceReplyInstruction=isReplyingToVoice
+      ? 'تعليم إلزامي لهذه الرسالة: أرسل إجابتك كتابةً كنص واتساب عادي فقط. لا تنشئ رسالة صوتية ولا تطلب تحويل الرد إلى صوت ولا تضع تعليمات أو علامات توحي بإرفاق تسجيل صوتي.'
+      : '';
     const effectiveSettings={
       ...settings,
-      system_prompt:[settings.system_prompt,secretary.system_prompt].filter(Boolean).join('\n\n')
+      system_prompt:[settings.system_prompt,secretary.system_prompt,voiceReplyInstruction].filter(Boolean).join('\n\n')
     };
     console.log('[Secretary routed]',{
       contactId:contact.id,secretaryId:secretary.id,secretaryName:secretary.name,
