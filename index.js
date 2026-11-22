@@ -24,6 +24,8 @@ const TAKEOVER_MINUTES = Math.max(5, Number(process.env.MANUAL_TAKEOVER_MINUTES 
 
 let ready = false;
 let latestQr = null;
+let whatsappServiceEnabled = true;
+let whatsappInitializing = false;
 const queues = new Map();
 const botOutbox = new Map();
 
@@ -307,6 +309,31 @@ client.on('message_create', (message) => {
   console.log('[Secretary] Manual reply detected; paused chat ' + chatId);
 });
 
+function startWhatsApp() {
+  if (whatsappServiceEnabled && (ready || whatsappInitializing)) return;
+  whatsappServiceEnabled = true;
+  whatsappInitializing = true;
+  latestQr = null;
+  console.log('[WhatsApp] Start requested from dashboard.');
+  setTimeout(() => {
+    if (!whatsappServiceEnabled) { whatsappInitializing = false; return; }
+    client.initialize().catch((error) => {
+      ready = false;
+      console.error('[WhatsApp] Initialization failed:', error.message);
+    }).finally(() => { whatsappInitializing = false; });
+  }, 250);
+}
+
+async function stopWhatsApp() {
+  whatsappServiceEnabled = false;
+  whatsappInitializing = false;
+  ready = false;
+  latestQr = null;
+  console.log('[WhatsApp] Stop requested from dashboard.');
+  try { await client.destroy(); }
+  catch (error) { console.warn('[WhatsApp] Stop cleanup:', error.message); }
+}
+
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 
@@ -333,6 +360,8 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     whatsapp: ready ? 'ready' : 'disconnected',
+    whatsappServiceEnabled,
+    whatsappInitializing,
     aiConfigured: Boolean(process.env.GEMINI_API_KEY),
     managerConfigured: Boolean(normalizePhone(process.env.MANAGER_PHONE || '')),
     automaticReplies: autoReply,
@@ -340,6 +369,19 @@ app.get('/health', (req, res) => {
     voiceModelConfigured: Boolean(process.env.GEMINI_API_KEY),
     timestamp: new Date().toISOString()
   });
+});
+
+app.post('/admin/whatsapp/start', adminOnly, (req, res) => {
+  if (whatsappServiceEnabled && (ready || whatsappInitializing)) {
+    return res.json({ ok: true, enabled: true, ready, starting: whatsappInitializing });
+  }
+  startWhatsApp();
+  return res.json({ ok: true, enabled: true, ready: false, starting: true });
+});
+
+app.post('/admin/whatsapp/stop', adminOnly, async (req, res) => {
+  await stopWhatsApp();
+  return res.json({ ok: true, enabled: false, ready: false, starting: false });
 });
 
 app.get('/admin/conversations', adminOnly, (req, res) => {
@@ -571,10 +613,12 @@ app.listen(PORT, HOST, () => {
   const browserStartDelay = Math.max(10000, Number(process.env.WHATSAPP_START_DELAY_MS || 15000));
   console.log('[WhatsApp] Browser initialization scheduled in ' + browserStartDelay + 'ms.');
   setTimeout(() => {
+    if (!whatsappServiceEnabled) return;
+    whatsappInitializing = true;
     client.initialize().catch((error) => {
       ready = false;
       console.error('[WhatsApp] Initialization failed:', error.message);
-    });
+    }).finally(() => { whatsappInitializing = false; });
   }, browserStartDelay);
 });
 
