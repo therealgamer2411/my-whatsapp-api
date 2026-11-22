@@ -1,52 +1,330 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+'use strict';
+
+require('dotenv').config();
+
+const crypto = require('node:crypto');
 const express = require('express');
+const qrcode = require('qrcode-terminal');
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const { state, conversation, addMessage, seen, markSeen, addLead, save, flush } = require('./store');
+const { getDecision, normalizePhone, handoffMessage } = require('./secretary');
+
 const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '127.0.0.1';
+const AUTO_REPLY = String(process.env.AUTO_REPLY_ENABLED || 'false').toLowerCase() === 'true';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const MANAGER_NAME = process.env.MANAGER_NAME || 'المستشار أحمد';
+const MANAGER_ROLE = process.env.MANAGER_ROLE || 'مدير متابعة العملاء';
+const TAKEOVER_MINUTES = Math.max(5, Number(process.env.MANUAL_TAKEOVER_MINUTES || 120));
 
-app.use(express.json());
+let ready = false;
+const queues = new Map();
+const botOutbox = new Map();
 
-// إعدادات خاصة لتشغيل المتصفح داخل Docker
-const client = new Client({
-    authStrategy: new LocalAuth(), // محاولة حفظ الجلسة
-    puppeteer: {
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process', 
-            '--disable-gpu'
-        ]
+function fingerprint(chatId, body) {
+  return chatId + '|' + String(body || '').replace(/\s+/g, ' ').trim();
+}
+
+async function sendBotMessage(chatId, text) {
+  if (!ready) throw new Error('WhatsApp is not connected.');
+  const body = String(text || '').trim();
+  if (!body) throw new Error('Message is empty.');
+  botOutbox.set(fingerprint(chatId, body), Date.now() + 120000);
+  return client.sendMessage(chatId, body);
+}
+
+function safeTokenEqual(a, b) {
+  if (!a || !b) return false;
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+function adminOnly(req, res, next) {
+  if (!ADMIN_TOKEN) return res.status(503).json({ error: 'ADMIN_TOKEN is not configured.' });
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!safeTokenEqual(ADMIN_TOKEN, token)) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+function enqueue(chatId, task) {
+  const previous = queues.get(chatId) || Promise.resolve();
+  const next = previous.catch(() => {}).then(task);
+  queues.set(chatId, next);
+  return next.finally(() => {
+    if (queues.get(chatId) === next) queues.delete(chatId);
+  });
+}
+
+async function customerName(message) {
+  try {
+    const contact = await message.getContact();
+    return contact.pushname || contact.name || contact.shortName || message._data?.notifyName || 'عميل';
+  } catch {
+    return message._data?.notifyName || 'عميل';
+  }
+}
+
+async function processMessage(message) {
+  if (!AUTO_REPLY || !ready || !message || message.fromMe || message.isGroupMsg) return;
+  const chatId = message.from;
+  if (!chatId || String(chatId).endsWith('@g.us') || chatId === 'status@broadcast') return;
+  if (!String(chatId).endsWith('@c.us') && !String(chatId).endsWith('@lid')) return;
+
+  const messageId = message.id && (message.id._serialized || message.id.id);
+  if (seen(messageId)) return;
+  markSeen(messageId);
+
+  const body = String(message.body || message.caption || '').trim();
+  const current = conversation(chatId);
+
+  if (current.paused || current.handedOff) {
+    if (current.pausedUntil && Date.now() > new Date(current.pausedUntil).getTime()) {
+      current.paused = false;
+      current.handedOff = false;
+      current.pauseReason = null;
+      current.pausedUntil = null;
+      save();
+    } else {
+      return;
     }
+  }
+
+  if (!body) {
+    const answer = 'وصلني مرفق من حضرتك. النسخة الحالية تتعامل مع الرسائل النصية؛ ممكن تكتب لي المطلوب في رسالة؟';
+    await sendBotMessage(chatId, answer);
+    addMessage(chatId, 'assistant', answer);
+    return;
+  }
+
+  addMessage(chatId, 'user', body);
+  current.customerName = current.customerName || await customerName(message);
+
+  let decision;
+  try {
+    decision = await getDecision(body, current.messages);
+  } catch (error) {
+    console.error('[AI] Request failed:', error.message);
+    decision = {
+      handoff: false,
+      reply: 'أعتذر لحضرتك، حصلت مشكلة مؤقتة أثناء تجهيز الرد. ممكن توضح لي طلبك في رسالة مختصرة؟',
+      lead_summary: body,
+      reason: 'AI_ERROR'
+    };
+  }
+
+  if (decision.handoff) {
+    const managerPhone = normalizePhone(process.env.MANAGER_PHONE || '');
+    const clientPhone = normalizePhone(String(chatId).split('@')[0]) || String(chatId);
+    const name = current.customerName || 'عميل';
+
+    current.paused = true;
+    current.handedOff = true;
+    current.pauseReason = 'handoff';
+    current.pausedUntil = null;
+    current.updatedAt = new Date().toISOString();
+
+    addLead({
+      id: crypto.randomUUID(),
+      chatId,
+      customerName: name,
+      customerPhone: clientPhone,
+      summary: decision.lead_summary || body,
+      reason: decision.reason || 'handoff',
+      createdAt: new Date().toISOString(),
+      status: 'awaiting_manager'
+    });
+
+    const answer = handoffMessage(MANAGER_NAME, MANAGER_ROLE, managerPhone);
+    await sendBotMessage(chatId, answer);
+    addMessage(chatId, 'assistant', answer);
+
+    if (managerPhone) {
+      const internal = [
+        '🔔 عميل جاهز للمتابعة',
+        'الاسم: ' + name,
+        'رقم العميل: ' + clientPhone,
+        'المرحلة: معاينة / شراء نهائي',
+        'ملخص الاحتياج: ' + (decision.lead_summary || body),
+        'آخر رسالة: ' + body.slice(0, 600)
+      ].join('\n');
+      try {
+        await sendBotMessage(managerPhone + '@c.us', internal);
+      } catch (error) {
+        console.error('[handoff] Could not notify manager:', error.message);
+      }
+    } else {
+      console.warn('[handoff] Add MANAGER_PHONE to .env before enabling live customer replies.');
+    }
+    save();
+    return;
+  }
+
+  const answer = decision.reply || 'شكرًا لتواصلك. ممكن توضح لي تفاصيل أكثر عن طلب حضرتك؟';
+  await sendBotMessage(chatId, answer);
+  addMessage(chatId, 'assistant', answer);
+}
+
+const client = new Client({
+  authStrategy: new LocalAuth({
+    clientId: 'mohamed-secretary',
+    dataPath: process.env.WWEBJS_AUTH_PATH || './.wwebjs_auth'
+  }),
+  puppeteer: {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--no-first-run',
+      '--disable-gpu'
+    ]
+  },
+  takeoverOnConflict: false
 });
 
 client.on('qr', (qr) => {
-    // السيرفر ليس له شاشة، سنطبع الكود في السجلات (Logs)
-    console.log('QR RECEIVED', qr);
-    qrcode.generate(qr, { small: true });
+  console.log('\nامسح QR من واتساب: الأجهزة المرتبطة ← ربط جهاز');
+  qrcode.generate(qr, { small: true });
 });
-
+client.on('authenticated', () => console.log('[WhatsApp] Authentication successful.'));
 client.on('ready', () => {
-    console.log('Client is ready!');
+  ready = true;
+  console.log('[WhatsApp] Connected and ready.');
+  console.log('[Secretary] Auto replies: ' + (AUTO_REPLY ? 'ON' : 'OFF'));
+});
+client.on('auth_failure', (message) => {
+  ready = false;
+  console.error('[WhatsApp] Authentication failure:', message);
+});
+client.on('disconnected', (reason) => {
+  ready = false;
+  console.warn('[WhatsApp] Disconnected:', reason);
 });
 
-app.post('/send', async (req, res) => {
-    const { phone, message } = req.body;
-    const chatId = `${phone}@c.us`;
-    try {
-        await client.sendMessage(chatId, message);
-        res.json({ status: 'success' });
-    } catch (err) {
-        res.status(500).json({ status: 'error', error: err.message });
-    }
+client.on('message', (message) => {
+  const chatId = message && message.from;
+  if (!chatId) return;
+  enqueue(chatId, () => processMessage(message)).catch((error) => {
+    console.error('[WhatsApp] Message handling failed:', error.message);
+  });
 });
 
-client.initialize();
+// If Mohamed sends a manual reply from his phone, pause that conversation.
+// Bot-generated messages are fingerprinted so they do not trigger this pause.
+client.on('message_create', (message) => {
+  if (!message || !message.fromMe || !message.to) return;
+  const chatId = message.to;
+  if (String(chatId).endsWith('@g.us')) return;
+  const key = fingerprint(chatId, message.body || '');
+  const expires = botOutbox.get(key);
+  if (expires && expires >= Date.now()) {
+    botOutbox.delete(key);
+    return;
+  }
+  const current = state.conversations[chatId];
+  if (!current) return;
+  current.paused = true;
+  current.handedOff = false;
+  current.pauseReason = 'manual_takeover';
+  current.pausedUntil = new Date(Date.now() + TAKEOVER_MINUTES * 60000).toISOString();
+  current.updatedAt = new Date().toISOString();
+  save();
+  console.log('[Secretary] Manual reply detected; paused chat ' + chatId);
+});
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+app.disable('x-powered-by');
+app.use(express.json({ limit: '256kb' }));
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    whatsapp: ready ? 'ready' : 'disconnected',
+    aiConfigured: Boolean(process.env.GEMINI_API_KEY),
+    managerConfigured: Boolean(normalizePhone(process.env.MANAGER_PHONE || '')),
+    automaticReplies: AUTO_REPLY,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/admin/conversations', adminOnly, (req, res) => {
+  const conversations = Object.entries(state.conversations).map(([chatId, item]) => ({
+    chatId,
+    customerName: item.customerName,
+    paused: item.paused,
+    pauseReason: item.pauseReason,
+    handedOff: item.handedOff,
+    updatedAt: item.updatedAt,
+    messages: (item.messages || []).slice(-4)
+  })).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  res.json({ conversations });
+});
+
+app.get('/admin/leads', adminOnly, (req, res) => {
+  res.json({ leads: state.leads.slice(-100).reverse() });
+});
+
+app.post('/admin/resume', adminOnly, (req, res) => {
+  const phone = normalizePhone(req.body && req.body.phone);
+  if (!phone) return res.status(400).json({ error: 'Provide a valid international phone number.' });
+  const chatId = phone + '@c.us';
+  const item = state.conversations[chatId];
+  if (!item) return res.status(404).json({ error: 'Conversation not found.' });
+  item.paused = false;
+  item.handedOff = false;
+  item.pauseReason = null;
+  item.pausedUntil = null;
+  item.updatedAt = new Date().toISOString();
+  save();
+  res.json({ ok: true, resumed: true, chatId });
+});
+
+app.post('/admin/pause', adminOnly, (req, res) => {
+  const phone = normalizePhone(req.body && req.body.phone);
+  if (!phone) return res.status(400).json({ error: 'Provide a valid international phone number.' });
+  const chatId = phone + '@c.us';
+  const item = conversation(chatId);
+  item.paused = true;
+  item.handedOff = false;
+  item.pauseReason = 'manual_admin';
+  item.pausedUntil = null;
+  item.updatedAt = new Date().toISOString();
+  save();
+  res.json({ ok: true, paused: true, chatId });
+});
+
+app.post('/send', adminOnly, async (req, res) => {
+  const phone = normalizePhone(req.body && req.body.phone);
+  const text = String((req.body && req.body.message) || '').trim();
+  if (!phone || !text) return res.status(400).json({ error: 'Provide phone and message.' });
+  if (!ready) return res.status(503).json({ error: 'WhatsApp is not connected.' });
+  try {
+    const id = await client.getNumberId(phone);
+    if (!id) return res.status(404).json({ error: 'This number is not available on WhatsApp.' });
+    const result = await sendBotMessage(id._serialized, text);
+    res.json({ ok: true, messageId: result.id && result.id._serialized });
+  } catch (error) {
+    res.status(502).json({ error: 'Message could not be sent.', detail: error.message });
+  }
+});
+
+app.listen(PORT, HOST, () => {
+  console.log('[HTTP] Admin API: http://' + HOST + ':' + PORT);
+  if (!ADMIN_TOKEN) console.warn('[Security] ADMIN_TOKEN missing; admin routes disabled.');
+  if (!process.env.GEMINI_API_KEY) console.warn('[AI] GEMINI_API_KEY missing; only a fallback response is available.');
+  if (!normalizePhone(process.env.MANAGER_PHONE || '')) console.warn('[Handoff] MANAGER_PHONE missing; configure it before live use.');
+  if (!AUTO_REPLY) console.log('[Secretary] AUTO_REPLY_ENABLED=false; no automatic replies will be sent.');
+});
+
+client.initialize().catch((error) => {
+  ready = false;
+  console.error('[WhatsApp] Initialization failed:', error.message);
+});
+
+process.on('SIGINT', () => {
+  console.log('\n[Shutdown] Saving local state...');
+  flush();
+  client.destroy().catch(() => {}).finally(() => process.exit(0));
 });
