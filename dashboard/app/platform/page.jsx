@@ -35,6 +35,9 @@ export default function PlatformPage() {
   });
   const [campaigns, setCampaigns] = useState([]);
   const [campaignContacts, setCampaignContacts] = useState([]);
+  const [selectedCampaignId, setSelectedCampaignId] = useState("");
+  const [campaignRecipients, setCampaignRecipients] = useState([]);
+  const [campaignSearch, setCampaignSearch] = useState("");
   const [campaignTitle, setCampaignTitle] = useState("");
   const [campaignBody, setCampaignBody] = useState("");
   const [campaignDelay, setCampaignDelay] = useState(10000);
@@ -288,6 +291,19 @@ export default function PlatformPage() {
     } catch (e) { flash(e.message, true); }
   }
 
+  async function loadCampaignRecipients(id = selectedCampaignId, search = campaignSearch) {
+    if (!id) return;
+    try {
+      const data = await request("/v1/campaigns/" + id + "/recipients?search=" + encodeURIComponent(search));
+      setCampaignRecipients(data.recipients || []);
+    } catch (e) { flash(e.message, true); }
+  }
+
+  async function searchCampaignLog(event) {
+    event.preventDefault();
+    await loadCampaignRecipients(selectedCampaignId, campaignSearch);
+  }
+
   async function sendMessage(event) {
     event.preventDefault();
     if (!activeContact || !messageDraft.trim()) return;
@@ -486,8 +502,19 @@ export default function PlatformPage() {
             <div className="panel-head"><div><span className="eyebrow">CAMPAIGN HISTORY</span><h3>سجل الحملات</h3></div></div>
             <div className="campaign-list">{campaigns.map(c=><div className="campaign-row" key={c.id}>
               <div><b>{c.title}</b><small>{c.status} · {c.sent_count}/{c.total_count} تم الإرسال · {c.failed_count} أخطاء</small></div>
-              <div className="campaign-actions">{c.status==="running"||c.status==="queued"? <button onClick={()=>campaignAction(c.id,"pause")}>إيقاف مؤقت</button>:null}{c.status==="paused"? <button onClick={()=>campaignAction(c.id,"resume")}>استئناف</button>:null}{["running","queued","paused"].includes(c.status)?<button onClick={()=>campaignAction(c.id,"cancel")}>إلغاء</button>:null}</div>
+              <div className="campaign-actions"><button onClick={()=>{setSelectedCampaignId(c.id);setCampaignSearch("");loadCampaignRecipients(c.id,"");}}>سجل الرسائل</button>{c.status==="running"||c.status==="queued"? <button onClick={()=>campaignAction(c.id,"pause")}>إيقاف مؤقت</button>:null}{c.status==="paused"? <button onClick={()=>campaignAction(c.id,"resume")}>استئناف</button>:null}{["running","queued","paused"].includes(c.status)?<button onClick={()=>campaignAction(c.id,"cancel")}>إلغاء</button>:null}</div>
             </div>)}</div>
+            {selectedCampaignId && <div className="campaign-recipient-log">
+              <div className="panel-head"><div><span className="eyebrow">MESSAGE AUDIT TRAIL</span><h3>سجل الرسائل التفصيلي</h3></div><button onClick={()=>{setSelectedCampaignId("");setCampaignRecipients([]);}}>إغلاق السجل</button></div>
+              <form className="campaign-search" onSubmit={searchCampaignLog}><input value={campaignSearch} onChange={e=>setCampaignSearch(e.target.value)} placeholder="ابحث بالرقم المرجعي أو الهاتف أو الاسم أو نص الرسالة"/><button className="mf-primary">بحث</button></form>
+              <div className="campaign-log-list">{campaignRecipients.map(r=><article className="campaign-log-item" key={r.id}>
+                <div className="campaign-log-meta"><b dir="ltr">{r.reference_code || "لم يُخصص رقم بعد"}</b><span dir="ltr">{r.phone_number}</span><span>{r.display_name}</span><span>{r.status==="sent"?"تم الإرسال":r.status==="failed"?"فشل":r.status==="skipped"?"تخطي":"في الانتظار"}</span></div>
+                <p>{r.sent_body || "لم تُجهز الرسالة للإرسال بعد."}</p>
+                <small>{r.sent_at ? new Date(r.sent_at).toLocaleString("ar-EG") : ""}{r.provider_message_id ? " · ID: "+r.provider_message_id : ""}{r.error ? " · "+r.error : ""}</small>
+                <button type="button" onClick={()=>navigator.clipboard?.writeText(r.reference_code || "")} disabled={!r.reference_code}>نسخ الرقم المرجعي</button>
+              </article>)}
+              {!campaignRecipients.length && <div className="empty-state">لا توجد نتائج مطابقة.</div>}</div>
+            </div>}
           </section>
           <div className="hint-panel"><span>ⓘ</span><p>الفواصل الزمنية هنا لتنظيم الحملات والتحكم في الحمل على الخادم، وليست وسيلة لتجاوز قيود واتساب أو ضمان عدم الحظر. أوقف الإرسال عند ظهور قيود أو شكاوى، واحترم طلبات إلغاء الاشتراك.</p></div>
         </div>}
