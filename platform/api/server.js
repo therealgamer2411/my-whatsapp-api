@@ -361,6 +361,16 @@ app.get('/v1/campaigns',auth,async (req,res)=>{
  const r=await pool.query('SELECT id,title,status,total_count,sent_count,failed_count,delay_ms,created_at,updated_at FROM campaigns WHERE workspace_id=$1 ORDER BY created_at DESC LIMIT 100',[req.actor.workspaceId]);
  res.json({campaigns:r.rows});
 });
+app.get('/v1/campaigns/:id/recipients',auth,async(req,res)=>{
+ const search=String(req.query.search||'').trim().slice(0,160), limit=Math.max(1,Math.min(200,Number(req.query.limit||100)));
+ const exists=await pool.query('SELECT id FROM campaigns WHERE id=$1 AND workspace_id=$2',[req.params.id,req.actor.workspaceId]);
+ if(!exists.rowCount)return res.status(404).json({error:'الحملة غير موجودة.'});
+ const r=await pool.query(`SELECT cr.id,cr.reference_code,cr.sent_body,cr.provider_message_id,cr.status,cr.error,cr.sent_at,c.phone_number,c.display_name
+  FROM campaign_recipients cr JOIN contacts c ON c.id=cr.contact_id AND c.workspace_id=cr.workspace_id
+  WHERE cr.campaign_id=$1 AND cr.workspace_id=$2 AND ($3='' OR cr.reference_code ILIKE '%'||$3||'%' OR c.phone_number ILIKE '%'||$3||'%' OR c.display_name ILIKE '%'||$3||'%' OR cr.sent_body ILIKE '%'||$3||'%')
+  ORDER BY cr.sent_at DESC NULLS LAST, c.phone_number LIMIT $4`,[req.params.id,req.actor.workspaceId,search,limit]);
+ res.json({recipients:r.rows});
+});
 const campaignWorkers=new Set(), sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function runCampaign(campaignId,workspaceId) {
  if(campaignWorkers.has(campaignId)) return; campaignWorkers.add(campaignId);
@@ -371,14 +381,23 @@ async function runCampaign(campaignId,workspaceId) {
   while(true) {
    const state=(await pool.query('SELECT status,delay_ms FROM campaigns WHERE id=$1 AND workspace_id=$2',[campaignId,workspaceId])).rows[0];
    if(!state||state.status==='cancelled'||state.status==='paused') break;
-   const item=(await pool.query("SELECT cr.id AS rid,cr.contact_id,cr.session_id,c.chat_id,c.marketing_opt_in,s.waha_name,s.status AS session_status FROM campaign_recipients cr JOIN contacts c ON c.id=cr.contact_id AND c.workspace_id=cr.workspace_id JOIN wa_sessions s ON s.id=cr.session_id AND s.workspace_id=cr.workspace_id WHERE cr.campaign_id=$1 AND cr.status='queued' ORDER BY cr.id LIMIT 1",[campaignId])).rows[0];
+   const item=(await pool.query("SELECT cr.id AS rid,cr.contact_id,cr.session_id,cr.reference_code,cr.sent_body,c.chat_id,c.marketing_opt_in,s.waha_name,s.status AS session_status FROM campaign_recipients cr JOIN contacts c ON c.id=cr.contact_id AND c.workspace_id=cr.workspace_id JOIN wa_sessions s ON s.id=cr.session_id AND s.workspace_id=cr.workspace_id WHERE cr.campaign_id=$1 AND cr.status='queued' ORDER BY cr.id LIMIT 1",[campaignId])).rows[0];
    if(!item){await pool.query("UPDATE campaigns SET status='completed',updated_at=NOW() WHERE id=$1 AND status='running'",[campaignId]);break;}
    if(!item.marketing_opt_in||!['WORKING','CONNECTED'].includes(String(item.session_status).toUpperCase())){
     await pool.query("UPDATE campaign_recipients SET status='skipped',error='Consent missing or session disconnected.' WHERE id=$1",[item.rid]);continue;
    }
    try{
-    const sent=await waha('POST','/api/sendText',{session:item.waha_name,chatId:item.chat_id,text:c.body});
-    await pool.query("INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status) VALUES($1,$2,$3,$4,$5,'outbound','text',$6,'sent') ON CONFLICT(session_id,wamid) DO NOTHING",[newId(),workspaceId,item.session_id,item.contact_id,String(sent?.id||'campaign-'+newId()),c.body]);
+    let referenceCode=item.reference_code, finalBody=item.sent_body;
+    if(!referenceCode){
+     const seq=(await pool.query("SELECT nextval('message_reference_seq') AS n")).rows[0].n;
+     referenceCode='MF-'+new Date().getFullYear()+'-'+String(seq).padStart(8,'0');
+     finalBody=referenceCode+' - '+c.body;
+     await pool.query("UPDATE campaign_recipients SET reference_code=$1,sent_body=$2 WHERE id=$3",[referenceCode,finalBody,item.rid]);
+    }
+    const sent=await waha('POST','/api/sendText',{session:item.waha_name,chatId:item.chat_id,text:finalBody});
+    const providerId=String(sent?.id||'campaign-'+newId());
+    await pool.query("INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status) VALUES($1,$2,$3,$4,$5,'outbound','text',$6,'sent') ON CONFLICT(session_id,wamid) DO NOTHING",[newId(),workspaceId,item.session_id,item.contact_id,providerId,finalBody]);
+    await pool.query("UPDATE campaign_recipients SET provider_message_id=$1 WHERE id=$2",[providerId,item.rid]);
     await pool.query("UPDATE campaign_recipients SET status='sent',sent_at=NOW() WHERE id=$1",[item.rid]);
     await pool.query('UPDATE campaigns SET sent_count=sent_count+1,updated_at=NOW() WHERE id=$1',[campaignId]);
    }catch(e){
