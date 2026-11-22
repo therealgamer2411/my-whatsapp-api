@@ -415,6 +415,15 @@ app.post('/admin/settings', adminOnly, (req, res) => {
   if (updates.MANAGER_PHONE && !normalizePhone(updates.MANAGER_PHONE)) {
     return res.status(400).json({ error: 'MANAGER_PHONE must be a valid international number.' });
   }
+  const enablingReplies = updates.AUTO_REPLY_ENABLED === 'true';
+  const effectiveGeminiKey = updates.GEMINI_API_KEY !== undefined ? updates.GEMINI_API_KEY : process.env.GEMINI_API_KEY;
+  const effectiveManagerPhone = updates.MANAGER_PHONE !== undefined ? updates.MANAGER_PHONE : process.env.MANAGER_PHONE;
+  if (enablingReplies && !effectiveGeminiKey) {
+    return res.status(400).json({ error: 'Add GEMINI_API_KEY before enabling automatic replies.' });
+  }
+  if (enablingReplies && !normalizePhone(effectiveManagerPhone || '')) {
+    return res.status(400).json({ error: 'Add a valid MANAGER_PHONE before enabling automatic replies.' });
+  }
 
   try {
     const envPath = path.resolve(process.env.ENV_FILE || '.env');
