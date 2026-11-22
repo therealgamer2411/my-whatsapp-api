@@ -76,6 +76,23 @@ Authorization: Bearer YOUR_ADMIN_TOKEN
 - يجب إضافة رقم أحمد قبل التشغيل الفعلي حتى يستلم إشعار التحويل ويظهر رقمه للعميل.
 
 
+## نشر محرك واتساب على Railway
+
+المستودع يحتوي على `Dockerfile` و`railway.toml` جاهزين للنشر.
+
+1. اربط المستودع `therealgamer2411/my-whatsapp-api` بخدمة Railway.
+2. اختر النشر من `Dockerfile` في جذر المستودع.
+3. أنشئ Volume واحدًا واربطه عند المسار `/app/persist`. هذا المسار يحفظ جلسة واتساب والذاكرة وملف الإعدادات بين عمليات إعادة التشغيل.
+4. أضف متغير `ADMIN_TOKEN` قويًا في متغيرات خدمة Railway.
+5. أضف `DASHBOARD_ORIGINS=https://media-first-secretary.vercel.app`.
+6. اترك `AUTO_REPLY_ENABLED=false` حتى تكتمل بيانات Gemini ورقم أحمد والاختبارات.
+7. أنشئ Public Domain للخدمة على المنفذ `3000`.
+8. ضع رابط الخدمة الناتج في صفحة واتساب داخل لوحة التحكم. لا تفتح الخدمة عبر HTTP غير المشفر.
+
+إعدادات Docker الافتراضية تضبط `HOST=0.0.0.0`، و`ENV_FILE=/app/persist/.env`، ومسارات البيانات والجلسة داخل الـVolume. بعد النشر، تحقق من `https://YOUR-WORKER-DOMAIN/health`.
+
+لا ترفع `.env` أو مجلد `.wwebjs_auth` إلى GitHub. أدخل Gemini API Key ورقم أحمد من لوحة التحكم بعد اتصال الخدمة.
+
 ## لوحة التحكم على Vercel
 
 تم نشر واجهة PWA على: https://media-first-secretary.vercel.app
