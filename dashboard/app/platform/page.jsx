@@ -574,7 +574,7 @@ export default function PlatformPage() {
               <div className="chat-head">
                 <div><b>{conversations.find((c) => c.id === activeContact)?.display_name || "محادثة العميل"}</b><span>{conversations.find((c) => c.id === activeContact)?.phone_number}</span></div>
                 <label className="secretary-inline-select">السكرتير المسؤول
-                  <select value={conversations.find((c) => c.id === activeContact)?.secretary_assignment === "manual" ? (conversations.find((c) => c.id === activeContact)?.secretary_id || "") : ""} onChange={(e) => assignConversationSecretary(e.target.value)}>
+                  <select value={["manual", "campaign"].includes(conversations.find((c) => c.id === activeContact)?.secretary_assignment) ? (conversations.find((c) => c.id === activeContact)?.secretary_id || "") : ""} onChange={(e) => assignConversationSecretary(e.target.value)}>
                     <option value="">توجيه ذكي تلقائي</option>
                     {secretaries.filter(s => s.enabled).map(s => <option key={s.id} value={s.id}>{s.name}{s.is_default ? " (عام)" : ""}</option>)}
                   </select>
