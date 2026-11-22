@@ -240,6 +240,7 @@ const client = new Client({
 });
 
 client.on('qr', (qr) => {
+  latestQr = qr;
   console.log('\nامسح QR من واتساب: الأجهزة المرتبطة ← ربط جهاز');
   qrcode.generate(qr, { small: true });
 });
