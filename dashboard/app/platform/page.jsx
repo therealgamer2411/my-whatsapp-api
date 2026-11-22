@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./platform.css";
 
 const ENV_API = process.env.NEXT_PUBLIC_PLATFORM_API_URL || "";
@@ -21,6 +21,9 @@ export default function PlatformPage() {
   const [qr, setQr] = useState("");
   const [sessionLabel, setSessionLabel] = useState("واتساب الشركة");
   const [conversations, setConversations] = useState([]);
+  const [syncingChats, setSyncingChats] = useState(false);
+  const [syncMessage, setSyncMessage] = useState("");
+  const syncStartedRef = useRef(new Set());
   const [activeContact, setActiveContact] = useState("");
   const [messages, setMessages] = useState([]);
   const [messageDraft, setMessageDraft] = useState("");
@@ -139,6 +142,35 @@ export default function PlatformPage() {
     const timer = window.setInterval(poll, 3500);
     return () => { active = false; window.clearInterval(timer); };
   }, [token, base, view, selectedSession, request]);
+
+  const syncSessionChats = useCallback(async (sessionId, offset = 0) => {
+    setSyncingChats(true);
+    setSyncMessage("جارٍ استيراد المحادثات من واتساب...");
+    try {
+      const result = await request("/v1/whatsapp/sessions/" + sessionId + "/sync", {
+        method: "POST", body: JSON.stringify({ limit: 100, offset })
+      });
+      const data = await request("/v1/conversations");
+      setConversations(data.conversations || []);
+      setSyncMessage("تمت مزامنة " + result.imported + " محادثة و" + result.messagesImported + " رسالة" + (result.hasMore ? " — توجد محادثات أخرى يمكن تحميلها." : "."));
+      return result;
+    } catch (e) {
+      setSyncMessage(e.message);
+      return null;
+    } finally {
+      setSyncingChats(false);
+    }
+  }, [request]);
+
+  useEffect(() => {
+    if (!token || view !== "inbox") return;
+    const connected = sessions.filter(s => ["WORKING", "CONNECTED"].includes(String(s.status).toUpperCase()));
+    for (const session of connected) {
+      if (syncStartedRef.current.has(session.id)) continue;
+      syncStartedRef.current.add(session.id);
+      syncSessionChats(session.id, 0);
+    }
+  }, [token, view, sessions, syncSessionChats]);
 
   useEffect(() => {
     if (!token || view !== "inbox") return;
@@ -459,9 +491,10 @@ export default function PlatformPage() {
 
         {view === "inbox" && <div className="mf-content inbox-layout">
           <section className="panel conversation-list">
-            <div className="panel-head"><div><span className="eyebrow">CUSTOMER MESSAGES</span><h3>المحادثات</h3></div><span className="count-badge">{conversations.length}</span></div>
+            <div className="panel-head"><div><span className="eyebrow">CUSTOMER MESSAGES</span><h3>المحادثات</h3></div><div className="inbox-head-actions"><span className="count-badge">{conversations.length}</span><button type="button" className="mf-secondary" disabled={syncingChats} onClick={() => { const s=sessions.find(x => ["WORKING","CONNECTED"].includes(String(x.status).toUpperCase())); if (s) syncSessionChats(s.id, 0); else setSyncMessage("لا يوجد رقم واتساب متصل حاليًا."); }}>{syncingChats ? "جارٍ المزامنة..." : "مزامنة واتساب ↻"}</button></div></div>
+            {syncMessage && <div className="sync-feedback">{syncMessage}</div>}
             {conversations.length === 0 && <div className="empty-state">لا توجد رسائل واردة بعد. اربط رقم واتساب لتبدأ.</div>}
-            {conversations.map((c) => <button key={c.id} className={"conversation-row " + (activeContact === c.id ? "chosen" : "")} onClick={async () => { setActiveContact(c.id); try { const d = await request("/v1/conversations/" + c.id + "/messages"); setMessages(d.messages || []); } catch (e) { flash(e.message,true); } }}>
+            {conversations.map((c) => <button key={c.id} className={"conversation-row " + (activeContact === c.id ? "chosen" : "")} onClick={async () => { setActiveContact(c.id); try { const d = await request("/v1/conversations/" + c.id + "/messages?sync=1"); setMessages(d.messages || []); } catch (e) { flash(e.message,true); } }}>
               <div className="avatar contact-avatar">{(c.display_name || "ع").slice(0,1)}</div><div className="conversation-copy"><b>{c.display_name}</b><small>{c.last_message || c.phone_number || "لا توجد رسائل"}</small></div><span className="conversation-mark">{c.is_paused ? "يدوي" : "AI"}</span>
             </button>)}
           </section>
