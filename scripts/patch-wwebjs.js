@@ -56,7 +56,7 @@ async function exposeFunctionWithRetry(page, name, fn, maxAttempts = 5) {
             lastError = error;
             const message = error && error.message ? error.message : String(error);
             if (
-                message.includes(`binding with name ${name}`) &&
+                message.includes('binding with name ' + name) &&
                 message.includes('already exists')
             ) {
                 return;
