@@ -26,6 +26,8 @@ export default function PlatformPage() {
   const syncStartedRef = useRef(new Set());
   const [activeContact, setActiveContact] = useState("");
   const [messages, setMessages] = useState([]);
+  const [audioUrls, setAudioUrls] = useState({});
+  const audioObjectUrlsRef = useRef(new Map());
   const [messageDraft, setMessageDraft] = useState("");
   const [assistant, setAssistant] = useState({
     enabled: false,
@@ -202,6 +204,33 @@ export default function PlatformPage() {
     }).catch((e) => { if (active) flash(e.message, true); });
     return () => { active = false; };
   }, [token, view, request]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const voiceMessages = messages.filter((m) =>
+      m.has_media && String(m.media_mimetype || "").toLowerCase().startsWith("audio/")
+    );
+    for (const message of voiceMessages) {
+      if (audioObjectUrlsRef.current.has(message.id)) continue;
+      fetch(base + "/v1/conversations/" + activeContact + "/messages/" + message.id + "/media", {
+        headers: token ? { Authorization: "Bearer " + token } : {},
+        cache: "no-store"
+      }).then(async (response) => {
+        if (!response.ok) throw new Error("Voice media unavailable");
+        return URL.createObjectURL(await response.blob());
+      }).then((url) => {
+        if (cancelled) { URL.revokeObjectURL(url); return; }
+        audioObjectUrlsRef.current.set(message.id, url);
+        setAudioUrls((old) => ({ ...old, [message.id]: url }));
+      }).catch(() => {});
+    }
+    return () => { cancelled = true; };
+  }, [messages, activeContact, base, token]);
+
+  useEffect(() => () => {
+    for (const url of audioObjectUrlsRef.current.values()) URL.revokeObjectURL(url);
+    audioObjectUrlsRef.current.clear();
+  }, []);
 
   useEffect(() => {
     if (!token || view !== "assistant") return;
@@ -581,7 +610,19 @@ export default function PlatformPage() {
                 </label>
                 <small className="secretary-route-note">التصنيف: {conversations.find((c) => c.id === activeContact)?.secretary_category || "بانتظار التصنيف"} · {conversations.find((c) => c.id === activeContact)?.secretary_assignment === "manual" ? "يدوي" : conversations.find((c) => c.id === activeContact)?.secretary_assignment === "campaign" ? "حملة" : conversations.find((c) => c.id === activeContact)?.secretary_assignment === "ai" ? "ذكاء اصطناعي" : "تلقائي"}</small>
               </div>
-              <div className="chat-messages">{messages.map((m) => <div key={m.id} className={"chat-bubble " + (m.direction === "outbound" ? "out" : "in")}><p>{m.body}</p><small>{new Date(m.sent_at).toLocaleString("ar-EG")}</small></div>)}</div>
+              <div className="chat-messages">{messages.map((m) => {
+                const isVoice = String(m.message_type || "").toLowerCase().startsWith("ptt") ||
+                  String(m.message_type || "").toLowerCase() === "audio" ||
+                  String(m.media_mimetype || "").toLowerCase().startsWith("audio/");
+                return <div key={m.id} className={"chat-bubble " + (m.direction === "outbound" ? "out" : "in") + (isVoice ? " voice-bubble" : "")}>
+                  {isVoice && <div className="voice-message-title">🎤 رسالة صوتية</div>}
+                  {isVoice && audioUrls[m.id] && <audio className="voice-audio-player" controls preload="none" src={audioUrls[m.id]} />}
+                  <p>{m.body}</p>
+                  {isVoice && m.transcription_status === "pending" && <small className="voice-status">جارٍ تحويل الصوت إلى نص...</small>}
+                  {isVoice && m.transcription_status === "failed" && <small className="voice-status failed">تعذر تفريغ الصوت؛ تم إبلاغ العميل بإعادة الإرسال.</small>}
+                  <small>{new Date(m.sent_at).toLocaleString("ar-EG")}</small>
+                </div>;
+              })}</div>
               <form className="composer" onSubmit={sendMessage}><input value={messageDraft} onChange={(e) => setMessageDraft(e.target.value)} placeholder="اكتب رسالة للعميل..." /><button className="mf-primary" disabled={busy || !messageDraft.trim()}>إرسال</button></form>
               <div className="takeover-row"><span>{conversations.find((c) => c.id === activeContact)?.is_paused ? "المساعد متوقف لهذه المحادثة بسبب التدخل اليدوي." : "المساعد الذكي يعمل تلقائيًا على هذه المحادثة."}</span><button type="button" onClick={() => togglePause(activeContact, !conversations.find((c) => c.id === activeContact)?.is_paused)}>{conversations.find((c) => c.id === activeContact)?.is_paused ? "استئناف المساعد" : "إيقاف المساعد"}</button></div>
             </>}
