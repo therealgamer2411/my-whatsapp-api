@@ -74,23 +74,53 @@ async function getDecision(customerText, messages) {
     'reply هو الرد الذي سيصل للعميل. lead_summary ملخص داخلي موجز. أعد JSON فقط.'
   ].join('\n');
 
-  const response = await ai.models.generateContent({
-    model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-    contents: prompt,
-    config: {
-      systemInstruction: SYSTEM,
-      responseMimeType: 'application/json',
-      temperature: 0.25,
-      maxOutputTokens: 450
+  const responseSchema = {
+    type: 'object',
+    properties: {
+      handoff: { type: 'boolean' },
+      reply: { type: 'string' },
+      lead_summary: { type: 'string' },
+      reason: { type: 'string' }
+    },
+    required: ['handoff', 'reply', 'lead_summary', 'reason']
+  };
+  const primaryModel = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+  const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite';
+  const request = (model) => ai.interactions.create({
+    model,
+    system_instruction: SYSTEM,
+    input: prompt,
+    response_format: {
+      type: 'text',
+      mime_type: 'application/json',
+      schema: responseSchema
+    },
+    generation_config: {
+      thinking_level: 'low',
+      max_output_tokens: 450
     }
   });
 
-  const result = parseJson(response.text);
+  let interaction;
+  let usedModel = primaryModel;
+  try {
+    interaction = await request(primaryModel);
+  } catch (error) {
+    const detail = String(error.message || error);
+    const temporaryCapacity = /503|UNAVAILABLE|high demand|temporarily overloaded|capacity|timed? ?out|timeout/i.test(detail);
+    if (!temporaryCapacity || fallbackModel === primaryModel) throw error;
+    console.warn('[AI] Primary model busy; retrying with fallback ' + fallbackModel + '.');
+    interaction = await request(fallbackModel);
+    usedModel = fallbackModel;
+    console.log('[AI] Fallback model succeeded: ' + usedModel);
+  }
+
+  const result = parseJson(interaction.output_text);
   return {
     handoff: result.handoff === true || explicitHandoff(customerText),
     reply: typeof result.reply === 'string' ? result.reply.trim().slice(0, 1400) : '',
     lead_summary: typeof result.lead_summary === 'string' ? result.lead_summary.slice(0, 700) : customerText.slice(0, 500),
-    reason: typeof result.reason === 'string' ? result.reason.slice(0, 100) : 'MODEL_DECISION'
+    reason: typeof result.reason === 'string' ? result.reason.slice(0, 100) : 'MODEL_DECISION (' + usedModel + ')'
   };
 }
 
