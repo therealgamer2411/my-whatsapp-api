@@ -83,7 +83,17 @@ function safeTokenEqual(a, b) {
 function adminOnly(req, res, next) {
   if (!ADMIN_TOKEN) return res.status(503).json({ error: 'ADMIN_TOKEN is not configured.' });
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  let token = '';
+  if (header.startsWith('Bearer-UTF8 ')) {
+    try {
+      const encoded = header.slice('Bearer-UTF8 '.length);
+      token = Buffer.from(encoded, 'base64').toString('utf8');
+      // Reject malformed/non-canonical UTF-8 encodings rather than silently replacing bytes.
+      if (Buffer.from(token, 'utf8').toString('base64') !== encoded) token = '';
+    } catch { token = ''; }
+  } else if (header.startsWith('Bearer ')) {
+    token = header.slice(7);
+  }
   if (!safeTokenEqual(ADMIN_TOKEN, token)) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
