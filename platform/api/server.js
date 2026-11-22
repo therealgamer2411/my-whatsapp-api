@@ -168,6 +168,10 @@ app.post('/webhooks/waha',express.raw({type:'application/json',limit:'2mb'}),asy
   try {
     await client.query('BEGIN');
     contact=await upsertContact(client,session,chatId,p.pushName || p._data?.notifyName || 'عميل');
+    // Honor simple opt-out keywords immediately and remove the contact from future campaigns.
+    if (/^(STOP|UNSUBSCRIBE|إلغاء|الغاء|توقف|إيقاف|ايقاف)$/i.test(body.trim())) {
+      await client.query("UPDATE contacts SET marketing_opt_in=FALSE,marketing_opt_in_at=NULL,marketing_opt_in_source='customer-opt-out' WHERE id=$1",[contact.id]);
+    }
     const wamid=typeof p.id==='string'?p.id:(p.id?._serialized || p.id?.id || newId());
     await client.query("INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at) VALUES($1,$2,$3,$4,$5,'inbound',$6,$7,'received',NOW()) ON CONFLICT(session_id,wamid) DO NOTHING",
       [newId(),session.workspace_id,session.id,contact.id,String(wamid),String(p.type || 'text'),body]);
@@ -446,6 +450,12 @@ async function start() {
   const needed=['DATABASE_URL','JWT_SECRET','SECRET_ENCRYPTION_KEY'];
   for (const key of needed) if (!process.env[key]) throw new Error(key+' is required.');
   await pool.query(fs.readFileSync(path.join(__dirname,'schema.sql'),'utf8'));
-  app.listen(Number(process.env.PORT || 3000),'0.0.0.0',()=>console.log('[Media First Platform API] listening.'));
+  // Recover queued work after a process restart; campaign state is durable in PostgreSQL.
+  await pool.query("UPDATE campaigns SET status='queued',updated_at=NOW() WHERE status='running'");
+  const pending=(await pool.query("SELECT id,workspace_id FROM campaigns WHERE status='queued' ORDER BY created_at")).rows;
+  app.listen(Number(process.env.PORT || 3000),'0.0.0.0',()=>{
+    console.log('[Media First Platform API] listening.');
+    for(const c of pending) setImmediate(()=>runCampaign(c.id,c.workspace_id));
+  });
 }
 start().catch(e=>{console.error('[Startup]',e);process.exit(1);});
