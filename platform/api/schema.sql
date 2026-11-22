@@ -31,6 +31,9 @@ ALTER TABLE contacts ADD COLUMN IF NOT EXISTS secretary_reason TEXT NOT NULL DEF
 CREATE INDEX IF NOT EXISTS contacts_secretary_idx ON contacts(workspace_id,secretary_id,secretary_assignment);
 CREATE INDEX IF NOT EXISTS contacts_workspace_last_idx ON contacts(workspace_id,last_message_at DESC);
 CREATE TABLE IF NOT EXISTS messages (id UUID PRIMARY KEY, workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, session_id UUID NOT NULL REFERENCES wa_sessions(id) ON DELETE CASCADE, contact_id UUID NOT NULL REFERENCES contacts(id) ON DELETE CASCADE, wamid TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')), message_type TEXT NOT NULL DEFAULT 'text', body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'received', sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(session_id,wamid));
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_mimetype TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS transcription_status TEXT NOT NULL DEFAULT 'none';
 CREATE INDEX IF NOT EXISTS messages_contact_time_idx ON messages(contact_id,sent_at DESC);
 CREATE TABLE IF NOT EXISTS webhook_events (id UUID PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL, session_name TEXT NOT NULL DEFAULT '', received_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS subscription_plans (id TEXT PRIMARY KEY, name TEXT NOT NULL, monthly_price_egp INTEGER NOT NULL DEFAULT 0, limits JSONB NOT NULL DEFAULT '{}'::jsonb, is_active BOOLEAN NOT NULL DEFAULT TRUE);
