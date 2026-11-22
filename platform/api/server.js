@@ -319,6 +319,78 @@ app.post('/v1/conversations/:id/resume',auth,async (req,res)=>{
   await pool.query("UPDATE contacts SET is_paused=FALSE,paused_reason='' WHERE id=$1",[c.id]); res.json({ok:true,paused:false});
 });
 
+
+app.patch('/v1/contacts/:id/marketing-consent',auth,roles(['owner','admin']),async (req,res)=>{
+ const enabled=req.body?.enabled===true, source=String(req.body?.source||'').trim().slice(0,160);
+ const r=await pool.query('UPDATE contacts SET marketing_opt_in=$1,marketing_opt_in_at=CASE WHEN $1 THEN NOW() ELSE NULL END,marketing_opt_in_source=$2 WHERE id=$3 AND workspace_id=$4 RETURNING id,phone_number,marketing_opt_in,marketing_opt_in_at',[enabled,enabled?source:'',req.params.id,req.actor.workspaceId]);
+ if(!r.rowCount) return res.status(404).json({error:'جهة الاتصال غير موجودة.'});
+ res.json({contact:r.rows[0]});
+});
+app.get('/v1/campaigns',auth,async (req,res)=>{
+ const r=await pool.query('SELECT id,title,status,total_count,sent_count,failed_count,delay_ms,created_at,updated_at FROM campaigns WHERE workspace_id=$1 ORDER BY created_at DESC LIMIT 100',[req.actor.workspaceId]);
+ res.json({campaigns:r.rows});
+});
+const campaignWorkers=new Set(), sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function runCampaign(campaignId,workspaceId) {
+ if(campaignWorkers.has(campaignId)) return; campaignWorkers.add(campaignId);
+ try {
+  const c=(await pool.query('SELECT * FROM campaigns WHERE id=$1 AND workspace_id=$2',[campaignId,workspaceId])).rows[0];
+  if(!c||!['queued','running'].includes(c.status)) return;
+  await pool.query("UPDATE campaigns SET status='running',updated_at=NOW() WHERE id=$1",[campaignId]);
+  while(true) {
+   const state=(await pool.query('SELECT status,delay_ms FROM campaigns WHERE id=$1 AND workspace_id=$2',[campaignId,workspaceId])).rows[0];
+   if(!state||state.status==='cancelled'||state.status==='paused') break;
+   const item=(await pool.query("SELECT cr.id AS rid,cr.contact_id,cr.session_id,c.chat_id,c.marketing_opt_in,s.waha_name,s.status AS session_status FROM campaign_recipients cr JOIN contacts c ON c.id=cr.contact_id AND c.workspace_id=cr.workspace_id JOIN wa_sessions s ON s.id=cr.session_id AND s.workspace_id=cr.workspace_id WHERE cr.campaign_id=$1 AND cr.status='queued' ORDER BY cr.id LIMIT 1",[campaignId])).rows[0];
+   if(!item){await pool.query("UPDATE campaigns SET status='completed',updated_at=NOW() WHERE id=$1 AND status='running'",[campaignId]);break;}
+   if(!item.marketing_opt_in||!['WORKING','CONNECTED'].includes(String(item.session_status).toUpperCase())){
+    await pool.query("UPDATE campaign_recipients SET status='skipped',error='Consent missing or session disconnected.' WHERE id=$1",[item.rid]);continue;
+   }
+   try{
+    const sent=await waha('POST','/api/sendText',{session:item.waha_name,chatId:item.chat_id,text:c.body});
+    await pool.query("INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status) VALUES($1,$2,$3,$4,$5,'outbound','text',$6,'sent') ON CONFLICT(session_id,wamid) DO NOTHING",[newId(),workspaceId,item.session_id,item.contact_id,String(sent?.id||'campaign-'+newId()),c.body]);
+    await pool.query("UPDATE campaign_recipients SET status='sent',sent_at=NOW() WHERE id=$1",[item.rid]);
+    await pool.query('UPDATE campaigns SET sent_count=sent_count+1,updated_at=NOW() WHERE id=$1',[campaignId]);
+   }catch(e){
+    await pool.query("UPDATE campaign_recipients SET status='failed',error=$1 WHERE id=$2",[String(e.message).slice(0,500),item.rid]);
+    await pool.query("UPDATE campaigns SET failed_count=failed_count+1,status='paused',updated_at=NOW() WHERE id=$1",[campaignId]);
+    console.error('[Campaign paused after provider error]',campaignId,e.message);break;
+   }
+   await sleep(state.delay_ms);
+  }
+ }catch(e){console.error('[Campaign worker]',campaignId,e.message);await pool.query("UPDATE campaigns SET status='failed',updated_at=NOW() WHERE id=$1",[campaignId]).catch(()=>{});}
+ finally{campaignWorkers.delete(campaignId);}
+}
+app.post('/v1/campaigns',auth,roles(['owner','admin']),async (req,res)=>{
+ const title=String(req.body?.title||'').trim().slice(0,120), body=String(req.body?.body||'').trim(), delay=Math.max(5000,Math.min(60000,Number(req.body?.delayMs||10000)));
+ if(!title||!body||body.length>4000)return res.status(400).json({error:'أدخل اسم الحملة ورسالة صحيحة لا تتجاوز 4000 حرف.'});
+ if(req.body?.confirmOptIn!==true)return res.status(400).json({error:'أكد أن جميع المستلمين وافقوا صراحةً على استقبال الرسائل.'});
+ const ids=Array.isArray(req.body?.contactIds)?[...new Set(req.body.contactIds.map(String))].slice(0,5000):[];
+ if(!ids.length)return res.status(400).json({error:'حدد جهات اتصال لديها موافقة تسويقية مسجلة.'});
+ const client=await pool.connect(), id=newId();
+ try{
+  await client.query('BEGIN');
+  const recipients=await client.query("SELECT c.id,c.session_id FROM contacts c JOIN wa_sessions s ON s.id=c.session_id WHERE c.workspace_id=$1 AND c.id=ANY($2::uuid[]) AND c.marketing_opt_in=TRUE AND s.status IN ('WORKING','CONNECTED')",[req.actor.workspaceId,ids]);
+  if(!recipients.rowCount){await client.query('ROLLBACK');return res.status(400).json({error:'لا توجد جهات اتصال مؤهلة: يلزم تسجيل الموافقة وربط رقم متصل.'});}
+  await client.query("INSERT INTO campaigns(id,workspace_id,title,body,status,delay_ms,total_count) VALUES($1,$2,$3,$4,'queued',$5,$6)",[id,req.actor.workspaceId,title,body,delay,recipients.rowCount]);
+  for(const row of recipients.rows)await client.query("INSERT INTO campaign_recipients(id,campaign_id,workspace_id,contact_id,session_id) VALUES($1,$2,$3,$4,$5)",[newId(),id,req.actor.workspaceId,row.id,row.session_id]);
+  await client.query('COMMIT');res.status(201).json({ok:true,campaign:{id,totalCount:recipients.rowCount,status:'queued',delayMs:delay}});
+  setImmediate(()=>runCampaign(id,req.actor.workspaceId));
+ }catch(e){await client.query('ROLLBACK');console.error('[Campaign create]',e.message);res.status(500).json({error:'تعذر إنشاء الحملة.'});}
+ finally{client.release();}
+});
+app.post('/v1/campaigns/:id/pause',auth,roles(['owner','admin']),async(req,res)=>{
+ const r=await pool.query("UPDATE campaigns SET status='paused',updated_at=NOW() WHERE id=$1 AND workspace_id=$2 AND status IN ('queued','running') RETURNING id,status",[req.params.id,req.actor.workspaceId]);
+ if(!r.rowCount)return res.status(404).json({error:'الحملة غير موجودة أو لا يمكن إيقافها.'});res.json({ok:true,campaign:r.rows[0]});
+});
+app.post('/v1/campaigns/:id/resume',auth,roles(['owner','admin']),async(req,res)=>{
+ const r=await pool.query("UPDATE campaigns SET status='queued',updated_at=NOW() WHERE id=$1 AND workspace_id=$2 AND status='paused' RETURNING id,status");
+ if(!r.rowCount)return res.status(404).json({error:'الحملة غير موجودة أو ليست متوقفة.'});res.json({ok:true,campaign:r.rows[0]});setImmediate(()=>runCampaign(req.params.id,req.actor.workspaceId));
+});
+app.post('/v1/campaigns/:id/cancel',auth,roles(['owner','admin']),async(req,res)=>{
+ const r=await pool.query("UPDATE campaigns SET status='cancelled',updated_at=NOW() WHERE id=$1 AND workspace_id=$2 AND status IN ('queued','running','paused') RETURNING id,status",[req.params.id,req.actor.workspaceId]);
+ if(!r.rowCount)return res.status(404).json({error:'الحملة غير موجودة أو انتهت.'});res.json({ok:true,campaign:r.rows[0]});
+});
+
 app.get('/v1/assistant/settings',auth,async (req,res)=>{
   const r=await pool.query("SELECT enabled,provider,model,base_url,system_prompt,(api_key_ciphertext<>'') AS has_api_key,updated_at FROM assistant_settings WHERE workspace_id=$1",[req.actor.workspaceId]);
   res.json({settings:r.rows[0] || null});
