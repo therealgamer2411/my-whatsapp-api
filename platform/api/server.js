@@ -289,7 +289,7 @@ app.delete('/v1/whatsapp/sessions/:id',auth,roles(['owner','admin']),async (req,
 });
 
 app.get('/v1/conversations',auth,async (req,res)=>{
-  const r=await pool.query('SELECT c.id,c.session_id,c.chat_id,c.phone_number,c.display_name,c.is_paused,c.last_message_at,s.label AS session_label,s.status AS session_status,m.body AS last_message,m.direction AS last_direction,m.sent_at AS last_message_time FROM contacts c JOIN wa_sessions s ON s.id=c.session_id LEFT JOIN LATERAL(SELECT body,direction,sent_at FROM messages WHERE contact_id=c.id ORDER BY sent_at DESC LIMIT 1)m ON TRUE WHERE c.workspace_id=$1 ORDER BY c.last_message_at DESC NULLS LAST LIMIT 150',[req.actor.workspaceId]);
+  const r=await pool.query('SELECT c.id,c.session_id,c.chat_id,c.phone_number,c.display_name,c.is_paused,c.marketing_opt_in,c.last_message_at,s.label AS session_label,s.status AS session_status,m.body AS last_message,m.direction AS last_direction,m.sent_at AS last_message_time FROM contacts c JOIN wa_sessions s ON s.id=c.session_id LEFT JOIN LATERAL(SELECT body,direction,sent_at FROM messages WHERE contact_id=c.id ORDER BY sent_at DESC LIMIT 1)m ON TRUE WHERE c.workspace_id=$1 ORDER BY c.last_message_at DESC NULLS LAST LIMIT 150',[req.actor.workspaceId]);
   res.json({conversations:r.rows});
 });
 app.get('/v1/conversations/:id/messages',auth,async (req,res)=>{
@@ -383,7 +383,7 @@ app.post('/v1/campaigns/:id/pause',auth,roles(['owner','admin']),async(req,res)=
  if(!r.rowCount)return res.status(404).json({error:'الحملة غير موجودة أو لا يمكن إيقافها.'});res.json({ok:true,campaign:r.rows[0]});
 });
 app.post('/v1/campaigns/:id/resume',auth,roles(['owner','admin']),async(req,res)=>{
- const r=await pool.query("UPDATE campaigns SET status='queued',updated_at=NOW() WHERE id=$1 AND workspace_id=$2 AND status='paused' RETURNING id,status");
+ const r=await pool.query("UPDATE campaigns SET status='queued',updated_at=NOW() WHERE id=$1 AND workspace_id=$2 AND status='paused' RETURNING id,status",[req.params.id,req.actor.workspaceId]);
  if(!r.rowCount)return res.status(404).json({error:'الحملة غير موجودة أو ليست متوقفة.'});res.json({ok:true,campaign:r.rows[0]});setImmediate(()=>runCampaign(req.params.id,req.actor.workspaceId));
 });
 app.post('/v1/campaigns/:id/cancel',auth,roles(['owner','admin']),async(req,res)=>{
