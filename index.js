@@ -514,51 +514,13 @@ async function runAiStartupDiagnostics() {
     return;
   }
 
-  const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-  try {
-    const dns = require('node:dns').promises;
-    const records = await dns.lookup('generativelanguage.googleapis.com', { all: true });
-    console.log('[AI Diagnostics] GEMINI_DNS_OK addresses=' + records.map(x => x.address).join(','));
-  } catch (error) {
-    console.error('[AI Diagnostics] GEMINI_DNS_FAILED: ' + String(error.message || error).slice(0, 300));
-  }
-  for (const url of ['https://www.google.com/generate_204', 'https://web.whatsapp.com', 'https://generativelanguage.googleapis.com/v1beta/models']) {
-    const host = new URL(url).hostname;
-    try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'manual' });
-      console.log('[AI Diagnostics] EGRESS_OK host=' + host + ' status=' + response.status);
-    } catch (error) {
-      console.error('[AI Diagnostics] EGRESS_FAILED host=' + host + ' error=' + String(error.message || error).slice(0, 250));
-    }
-  }
-  try {
-    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' +
-      encodeURIComponent(model) + ':generateContent', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: 'Respond with exactly: OK' }] }],
-        generationConfig: { temperature: 0, maxOutputTokens: 8 }
-      }),
-      signal: AbortSignal.timeout(30000)
-    });
-    const raw = await response.text();
-    if (!response.ok) throw new Error('REST HTTP ' + response.status + ': ' + raw.slice(0, 500));
-    const payload = JSON.parse(raw);
-    const text = payload.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('').trim();
-    if (!text) throw new Error('Gemini REST returned no text.');
-    console.log('[AI Diagnostics] REST_TEXT_OK model=' + model);
-  } catch (error) {
-    console.error('[AI Diagnostics] REST_TEXT_FAILED: ' + String(error.message || error).slice(0, 650));
-  }
-
   console.log('[AI Diagnostics] CHAT_LOGIC_START');
   try {
     const decision = await getDecision('السلام عليكم، ممكن أعرف خدماتكم؟', []);
     if (!decision || !String(decision.reply || '').trim()) throw new Error('Assistant returned an empty reply.');
-    console.log('[AI Diagnostics] CHAT_LOGIC_OK replyChars=' + decision.reply.length + ' handoff=' + Boolean(decision.handoff));
+    console.log('[AI Diagnostics] CHAT_LOGIC_OK replyChars=' + decision.reply.length + ' reason=' + String(decision.reason || '').slice(0, 100));
   } catch (error) {
-    console.error('[AI Diagnostics] CHAT_LOGIC_FAILED: ' + String(error.message || error).slice(0, 500));
+    console.error('[AI Diagnostics] CHAT_LOGIC_FAILED: ' + String(error.message || error).slice(0, 550));
   }
 
   console.log('[AI Diagnostics] TTS_START');
