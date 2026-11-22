@@ -1,0 +1,396 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import "./platform.css";
+
+const ENV_API = process.env.NEXT_PUBLIC_PLATFORM_API_URL || "";
+const blankForm = { fullName: "", email: "", password: "", workspaceName: "" };
+
+export default function PlatformPage() {
+  const [apiUrl, setApiUrl] = useState(ENV_API);
+  const [token, setToken] = useState("");
+  const [user, setUser] = useState(null);
+  const [workspace, setWorkspace] = useState(null);
+  const [mode, setMode] = useState("register");
+  const [form, setForm] = useState(blankForm);
+  const [view, setView] = useState("overview");
+  const [sessions, setSessions] = useState([]);
+  const [overview, setOverview] = useState(null);
+  const [selectedSession, setSelectedSession] = useState("");
+  const [sessionStatus, setSessionStatus] = useState("");
+  const [qr, setQr] = useState("");
+  const [sessionLabel, setSessionLabel] = useState("واتساب الشركة");
+  const [conversations, setConversations] = useState([]);
+  const [activeContact, setActiveContact] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [messageDraft, setMessageDraft] = useState("");
+  const [assistant, setAssistant] = useState({
+    enabled: false,
+    provider: "openai-compatible",
+    model: "",
+    base_url: "",
+    system_prompt: "أنت مساعد خدمة عملاء محترف. تحدث باللغة المناسبة للعميل، ولا تخترع أسعارًا أو معلومات غير موجودة.",
+    apiKey: "",
+    has_api_key: false
+  });
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+
+  const base = useMemo(() => String(apiUrl || "").trim().replace(/\/+$/, ""), [apiUrl]);
+
+  useEffect(() => {
+    try {
+      const savedToken = localStorage.getItem("mf-platform-token") || "";
+      const savedApi = localStorage.getItem("mf-platform-api") || "";
+      if (!ENV_API && savedApi) setApiUrl(savedApi);
+      if (savedToken) setToken(savedToken);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem("mf-platform-api", base); } catch {}
+  }, [base]);
+
+  const request = useCallback(async (route, options = {}) => {
+    if (!base) throw new Error("أدخل رابط خادم المنصة أولًا.");
+    const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+    if (token) headers.Authorization = "Bearer " + token;
+    const response = await fetch(base + route, {
+      ...options,
+      headers,
+      cache: "no-store",
+      body: options.body ? options.body : undefined
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "تعذر تنفيذ الطلب (" + response.status + ").");
+    return data;
+  }, [base, token]);
+
+  const flash = (message, isError = false) => {
+    setError(isError ? message : "");
+    setNotice(isError ? "" : message);
+    window.setTimeout(() => {
+      setNotice((v) => v === message ? "" : v);
+      setError((v) => v === message ? "" : v);
+    }, 5000);
+  };
+
+  const loadOverview = useCallback(async () => {
+    const [stats, sessionData, inboxData] = await Promise.all([
+      request("/v1/overview"),
+      request("/v1/whatsapp/sessions"),
+      request("/v1/conversations")
+    ]);
+    setOverview(stats);
+    setSessions(sessionData.sessions || []);
+    setConversations(inboxData.conversations || []);
+  }, [request]);
+
+  useEffect(() => {
+    if (!token || !base) return;
+    let active = true;
+    request("/v1/auth/me").then((data) => {
+      if (!active) return;
+      setUser(data.user);
+      setWorkspace(data.workspace);
+    }).then(() => loadOverview()).catch((e) => {
+      if (!active) return;
+      localStorage.removeItem("mf-platform-token");
+      setToken("");
+      setUser(null);
+      setWorkspace(null);
+      flash(e.message, true);
+    });
+    return () => { active = false; };
+  }, [token, base, request, loadOverview]);
+
+  useEffect(() => {
+    if (!token || !base || view !== "whatsapp" || !selectedSession) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const status = await request("/v1/whatsapp/sessions/" + selectedSession);
+        if (!active) return;
+        setSessionStatus(status.status || "");
+        if (["SCAN_QR_CODE", "STARTING", "UNKNOWN", "FAILED"].includes(status.status)) {
+          const qrData = await request("/v1/whatsapp/sessions/" + selectedSession + "/qr");
+          if (active) setQr(qrData.dataUrl || "");
+        } else {
+          setQr("");
+        }
+        const list = await request("/v1/whatsapp/sessions");
+        if (active) setSessions(list.sessions || []);
+      } catch {}
+    };
+    poll();
+    const timer = window.setInterval(poll, 3500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [token, base, view, selectedSession, request]);
+
+  useEffect(() => {
+    if (!token || view !== "inbox") return;
+    let active = true;
+    const load = async () => {
+      try {
+        const data = await request("/v1/conversations");
+        if (active) setConversations(data.conversations || []);
+        if (activeContact) {
+          const detail = await request("/v1/conversations/" + activeContact + "/messages");
+          if (active) setMessages(detail.messages || []);
+        }
+      } catch {}
+    };
+    load();
+    const timer = window.setInterval(load, 4500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [token, view, activeContact, request]);
+
+  useEffect(() => {
+    if (!token || view !== "assistant") return;
+    request("/v1/assistant/settings").then((data) => {
+      if (!data.settings) return;
+      setAssistant((old) => ({ ...old, ...data.settings, apiKey: "", has_api_key: data.settings.has_api_key }));
+    }).catch((e) => flash(e.message, true));
+  }, [token, view, request]);
+
+  async function authenticate(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      if (!base) throw new Error("أدخل رابط خادم المنصة.");
+      const response = await fetch(base + "/v1/auth/" + mode, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(mode === "register" ? form : { email: form.email, password: form.password })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "تعذر تسجيل الدخول.");
+      localStorage.setItem("mf-platform-token", data.token);
+      setToken(data.token);
+      setUser({ fullName: data.user.full_name || data.user.fullName, email: data.user.email });
+      setWorkspace(data.workspace);
+      setForm(blankForm);
+      flash("تم تسجيل الدخول بنجاح.");
+    } catch (e) { flash(e.message, true); }
+    finally { setBusy(false); }
+  }
+
+  function logout() {
+    localStorage.removeItem("mf-platform-token");
+    setToken(""); setUser(null); setWorkspace(null);
+    setSessions([]); setConversations([]); setView("overview");
+  }
+
+  async function createSession(event) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const data = await request("/v1/whatsapp/sessions", {
+        method: "POST",
+        body: JSON.stringify({ label: sessionLabel })
+      });
+      setSelectedSession(data.session.id);
+      setSessionStatus(data.session.status || "STARTING");
+      setQr("");
+      await loadOverview();
+      flash("تم إنشاء جلسة واتساب. جارٍ تجهيز QR.");
+    } catch (e) { flash(e.message, true); }
+    finally { setBusy(false); }
+  }
+
+  async function sendMessage(event) {
+    event.preventDefault();
+    if (!activeContact || !messageDraft.trim()) return;
+    setBusy(true);
+    try {
+      await request("/v1/conversations/" + activeContact + "/messages", {
+        method: "POST", body: JSON.stringify({ text: messageDraft.trim() })
+      });
+      setMessageDraft("");
+      const data = await request("/v1/conversations/" + activeContact + "/messages");
+      setMessages(data.messages || []);
+      flash("تم إرسال الرسالة.");
+    } catch (e) { flash(e.message, true); }
+    finally { setBusy(false); }
+  }
+
+  async function saveAssistant(event) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const payload = {
+        enabled: assistant.enabled,
+        provider: assistant.provider,
+        model: assistant.model,
+        baseUrl: assistant.base_url,
+        systemPrompt: assistant.system_prompt,
+        apiKey: assistant.apiKey
+      };
+      await request("/v1/assistant/settings", { method: "POST", body: JSON.stringify(payload) });
+      setAssistant((old) => ({ ...old, apiKey: "", has_api_key: old.has_api_key || Boolean(payload.apiKey) }));
+      flash("تم حفظ إعدادات المساعد. الرد التلقائي " + (assistant.enabled ? "مفعّل." : "متوقف."));
+    } catch (e) { flash(e.message, true); }
+    finally { setBusy(false); }
+  }
+
+  async function togglePause(contact, resume) {
+    try {
+      await request("/v1/conversations/" + contact + (resume ? "/resume" : "/pause"), { method: "POST", body: "{}" });
+      const data = await request("/v1/conversations");
+      setConversations(data.conversations || []);
+    } catch (e) { flash(e.message, true); }
+  }
+
+  if (!token || !user) {
+    return (
+      <main className="mf-platform auth-screen" dir="rtl">
+        <div className="auth-brand">
+          <div className="mf-mark">MF</div>
+          <div><span>MEDIA FIRST</span><small>AI SECRETARY PLATFORM</small></div>
+        </div>
+        <section className="auth-card">
+          <div className="eyebrow">WORKSPACE ACCESS</div>
+          <h1>{mode === "register" ? "ابدأ مساحة عمل شركتك" : "مرحبًا بعودتك"}</h1>
+          <p className="muted">منصة موحدة لإدارة واتساب ومحادثات العملاء والمساعد الذكي.</p>
+          <div className="auth-tabs">
+            <button className={mode === "register" ? "selected" : ""} onClick={() => setMode("register")}>حساب جديد</button>
+            <button className={mode === "login" ? "selected" : ""} onClick={() => setMode("login")}>تسجيل الدخول</button>
+          </div>
+          <form onSubmit={authenticate} className="mf-form">
+            {mode === "register" && <>
+              <label>اسمك<input required value={form.fullName} onChange={(e) => setForm({ ...form, fullName: e.target.value })} placeholder="الاسم الكامل"/></label>
+              <label>اسم الشركة أو النشاط<input required value={form.workspaceName} onChange={(e) => setForm({ ...form, workspaceName: e.target.value })} placeholder="اسم مساحة العمل"/></label>
+            </>}
+            <label>البريد الإلكتروني<input required type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="name@company.com" dir="ltr"/></label>
+            <label>كلمة المرور<input required type="password" minLength={mode === "register" ? 10 : 1} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder={mode === "register" ? "10 أحرف على الأقل" : "كلمة المرور"}/></label>
+            <button className="mf-primary full" disabled={busy}>{busy ? "جارٍ التنفيذ..." : mode === "register" ? "إنشاء مساحة العمل" : "دخول"}</button>
+          </form>
+          {!ENV_API && <label className="api-config">رابط خادم المنصة<input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} placeholder="https://your-platform-api.up.railway.app" dir="ltr"/></label>}
+          {error && <div className="mf-alert error">{error}</div>}
+          {notice && <div className="mf-alert">{notice}</div>}
+          <p className="auth-foot">Media First · Stack Core Systems</p>
+        </section>
+      </main>
+    );
+  }
+
+  const nav = [
+    ["overview", "نظرة عامة", "⌂"],
+    ["whatsapp", "حسابات واتساب", "◉"],
+    ["inbox", "صندوق المحادثات", "▤"],
+    ["assistant", "المساعد الذكي", "✧"]
+  ];
+
+  return (
+    <main className="mf-platform" dir="rtl">
+      <aside className="mf-sidebar">
+        <div className="mf-brand">
+          <div className="mf-mark">MF</div>
+          <div><b>MEDIA FIRST</b><small>AI SECRETARY</small></div>
+        </div>
+        <div className="workspace-tag"><span className="live-dot"></span><div><small>مساحة العمل</small><strong>{workspace?.name || "شركتك"}</strong></div></div>
+        <nav>
+          {nav.map(([key,label,icon]) => <button key={key} className={view === key ? "active" : ""} onClick={() => setView(key)}><span>{icon}</span>{label}</button>)}
+        </nav>
+        <div className="sidebar-bottom">
+          <div className="profile-mini"><div className="avatar">{(user.fullName || "م").slice(0,1)}</div><div><b>{user.fullName}</b><small>{user.email}</small></div></div>
+          <button className="logout" onClick={logout}>تسجيل الخروج ↗</button>
+        </div>
+      </aside>
+
+      <section className="mf-main">
+        <header className="mf-topbar">
+          <div><span className="eyebrow">MEDIA FIRST / SAAS</span><h1>{nav.find((x) => x[0] === view)?.[1]}</h1></div>
+          <div className="topbar-meta"><span className="plan-chip">خطة تجريبية</span><span className="user-chip">{user.fullName}</span></div>
+        </header>
+
+        {notice && <div className="mf-alert">{notice}</div>}
+        {error && <div className="mf-alert error">{error}</div>}
+
+        {view === "overview" && <div className="mf-content">
+          <section className="welcome-panel">
+            <div><span className="eyebrow">INTELLIGENT CUSTOMER OPERATIONS</span><h2>كل محادثات عملك، في مكان واحد.</h2><p>اربط أرقام واتساب، تابع العملاء، وشغّل مساعدك الذكي من لوحة واحدة.</p><button className="mf-primary" onClick={() => setView("whatsapp")}>ربط حساب واتساب <span>←</span></button></div>
+            <div className="welcome-orb">✧<i></i></div>
+          </section>
+          <div className="metric-grid">
+            <Metric label="حسابات واتساب" value={overview?.sessions?.total ?? "—"} note={(overview?.sessions?.connected ?? 0) + " متصل"} icon="◉"/>
+            <Metric label="جهات الاتصال" value={overview?.contacts ?? "—"} note="العملاء المسجلون" icon="♙"/>
+            <Metric label="الرسائل خلال 30 يومًا" value={overview?.messages30d ?? "—"} note="الواردة والصادرة" icon="▤"/>
+          </div>
+          <section className="panel">
+            <div className="panel-head"><div><span className="eyebrow">WORKSPACE</span><h3>مساحة العمل الحالية</h3></div><span className="state-pill">نشطة</span></div>
+            <div className="workspace-details"><div><small>الشركة</small><b>{workspace?.name}</b></div><div><small>المعرّف</small><b dir="ltr">{workspace?.slug}</b></div><div><small>الباقة</small><b>{overview?.subscription?.name || "Starter"}</b></div></div>
+          </section>
+          <div className="hint-panel"><span>ⓘ</span><p>الرد الآلي يبدأ متوقفًا. اختبر ربط الرقم وإعدادات الذكاء الاصطناعي أولًا، ثم فعّله يدويًا عندما تكون مستعدًا.</p></div>
+        </div>}
+
+        {view === "whatsapp" && <div className="mf-content two-column">
+          <section className="panel">
+            <div className="panel-head"><div><span className="eyebrow">CONNECTED ACCOUNTS</span><h3>حسابات واتساب</h3></div><span className="count-badge">{sessions.length}</span></div>
+            <form className="inline-create" onSubmit={createSession}><input value={sessionLabel} onChange={(e) => setSessionLabel(e.target.value)} placeholder="اسم الرقم / الفرع"/><button className="mf-primary" disabled={busy}>إضافة رقم +</button></form>
+            <div className="session-list">
+              {sessions.length === 0 && <div className="empty-state">لم تتم إضافة أي رقم بعد. أنشئ أول جلسة لبدء الربط.</div>}
+              {sessions.map((s) => <button key={s.id} className={"session-row " + (selectedSession === s.id ? "chosen" : "")} onClick={() => { setSelectedSession(s.id); setQr(""); }}>
+                <div className="whatsapp-icon">◉</div><div className="session-info"><b>{s.label}</b><small dir="ltr">{s.phone_number || s.engine || "بانتظار الربط"}</small></div><span className={"mini-status " + (["WORKING","CONNECTED"].includes(s.status) ? "ok" : "")}>{s.status}</span>
+              </button>)}
+            </div>
+          </section>
+          <section className="panel pairing-panel">
+            <div className="panel-head"><div><span className="eyebrow">DEVICE PAIRING</span><h3>ربط الهاتف</h3></div></div>
+            {!selectedSession ? <div className="empty-qr"><div>▦</div><b>اختر حسابًا من القائمة</b><p>بعد إنشاء الجلسة، سيظهر رمز الربط هنا.</p></div> :
+              <div className="qr-stage">
+                {qr ? <img src={qr} alt="WhatsApp QR code"/> : <div className="qr-placeholder"><span className="spinner"></span><b>{sessionStatus || "جارٍ انتظار رمز QR"}</b><small>يتم تحديث حالة الجلسة تلقائيًا</small></div>}
+                <div className="pairing-status"><span className={["WORKING","CONNECTED"].includes(sessionStatus) ? "connected" : ""}></span>{["WORKING","CONNECTED"].includes(sessionStatus) ? "واتساب متصل" : "في انتظار مسح الرمز"}</div>
+                <p>افتح واتساب على هاتفك ← الأجهزة المرتبطة ← ربط جهاز، ثم امسح الرمز.</p>
+              </div>}
+            <div className="note-small">تُحفظ بيانات الجلسة على الخادم، ولا يحتاج العميل إلى إبقاء جهازه مفتوحًا.</div>
+          </section>
+        </div>}
+
+        {view === "inbox" && <div className="mf-content inbox-layout">
+          <section className="panel conversation-list">
+            <div className="panel-head"><div><span className="eyebrow">CUSTOMER MESSAGES</span><h3>المحادثات</h3></div><span className="count-badge">{conversations.length}</span></div>
+            {conversations.length === 0 && <div className="empty-state">لا توجد رسائل واردة بعد. اربط رقم واتساب لتبدأ.</div>}
+            {conversations.map((c) => <button key={c.id} className={"conversation-row " + (activeContact === c.id ? "chosen" : "")} onClick={async () => { setActiveContact(c.id); try { const d = await request("/v1/conversations/" + c.id + "/messages"); setMessages(d.messages || []); } catch (e) { flash(e.message,true); } }}>
+              <div className="avatar contact-avatar">{(c.display_name || "ع").slice(0,1)}</div><div className="conversation-copy"><b>{c.display_name}</b><small>{c.last_message || c.phone_number || "لا توجد رسائل"}</small></div><span className="conversation-mark">{c.is_paused ? "يدوي" : "AI"}</span>
+            </button>)}
+          </section>
+          <section className="panel chat-panel">
+            {!activeContact ? <div className="empty-qr"><div>▤</div><b>اختر محادثة</b><p>حدد عميلًا من القائمة لعرض الرسائل والرد عليه.</p></div> : <>
+              <div className="chat-head"><b>{conversations.find((c) => c.id === activeContact)?.display_name || "محادثة العميل"}</b><span>{conversations.find((c) => c.id === activeContact)?.phone_number}</span></div>
+              <div className="chat-messages">{messages.map((m) => <div key={m.id} className={"chat-bubble " + (m.direction === "outbound" ? "out" : "in")}><p>{m.body}</p><small>{new Date(m.sent_at).toLocaleString("ar-EG")}</small></div>)}</div>
+              <form className="composer" onSubmit={sendMessage}><input value={messageDraft} onChange={(e) => setMessageDraft(e.target.value)} placeholder="اكتب رسالة للعميل..." /><button className="mf-primary" disabled={busy || !messageDraft.trim()}>إرسال</button></form>
+              <div className="takeover-row"><span>الرد الآلي متوقف لهذه المحادثة عند التدخل اليدوي.</span><button onClick={() => togglePause(activeContact, !conversations.find((c) => c.id === activeContact)?.is_paused)}>{conversations.find((c) => c.id === activeContact)?.is_paused ? "استئناف المساعد" : "إيقاف المساعد"}</button></div>
+            </>}
+          </section>
+        </div>}
+
+        {view === "assistant" && <div className="mf-content">
+          <section className="panel assistant-panel">
+            <div className="panel-head"><div><span className="eyebrow">AI CONFIGURATION</span><h3>إعدادات المساعد الذكي</h3></div><span className={assistant.enabled ? "state-pill" : "state-pill muted-state"}>{assistant.enabled ? "مفعّل" : "متوقف"}</span></div>
+            <p className="muted">اختر محرك ذكاء اصطناعي يمكن استضافته ذاتيًا مثل Ollama أو vLLM عبر واجهة OpenAI-compatible، أو اربط مزودًا خارجيًا. مفتاح كل مساحة عمل يُخزّن مشفرًا.</p>
+            <form className="mf-form settings-form" onSubmit={saveAssistant}>
+              <label>مزود الذكاء الاصطناعي<select value={assistant.provider} onChange={(e) => setAssistant({ ...assistant, provider: e.target.value })}><option value="openai-compatible">محرك ذاتي / OpenAI-compatible (Ollama, vLLM)</option><option value="gemini">Google Gemini API</option></select></label>
+              {assistant.provider === "openai-compatible" && <>
+                <label>عنوان API<input dir="ltr" value={assistant.base_url} onChange={(e) => setAssistant({ ...assistant, base_url: e.target.value })} placeholder="http://inference-server:11434/v1"/></label>
+                <label>اسم النموذج<input dir="ltr" value={assistant.model} onChange={(e) => setAssistant({ ...assistant, model: e.target.value })} placeholder="qwen2.5:14b أو اسم النموذج"/></label>
+              </>}
+              {assistant.provider === "gemini" && <label>اسم النموذج<input dir="ltr" value={assistant.model} onChange={(e) => setAssistant({ ...assistant, model: e.target.value })} placeholder="gemini-2.5-flash"/></label>}
+              <label>مفتاح API {assistant.has_api_key && <small className="saved-key">يوجد مفتاح محفوظ</small>}<input type="password" autoComplete="new-password" value={assistant.apiKey} onChange={(e) => setAssistant({ ...assistant, apiKey: e.target.value })} placeholder="اتركه فارغًا للإبقاء على المفتاح الحالي"/></label>
+              <label>تعليمات شخصية المساعد<textarea rows={5} value={assistant.system_prompt} onChange={(e) => setAssistant({ ...assistant, system_prompt: e.target.value })}/></label>
+              <div className="switch-line"><div><b>تشغيل الرد التلقائي</b><small>لا يتم الرد إلا بعد تفعيل هذا الخيار وربط جلسة واتساب.</small></div><button type="button" role="switch" aria-checked={assistant.enabled} className={"switch " + (assistant.enabled ? "on" : "")} onClick={() => setAssistant({ ...assistant, enabled: !assistant.enabled })}><i/></button></div>
+              <button className="mf-primary" disabled={busy}>حفظ إعدادات المساعد</button>
+            </form>
+          </section>
+          <div className="hint-panel"><span>ⓘ</span><p>استخدام نموذج مستضاف على خوادم Media First يزيل رسوم API الخارجية، لكنه يتطلب موارد GPU/CPU وذاكرة مناسبة. لم يتم تشغيل نموذج محلي فعلي بعد.</p></div>
+        </div>}
+      </section>
+    </main>
+  );
+}
+
+function Metric({ label, value, note, icon }) {
+  return <article className="metric-card"><div className="metric-icon">{icon}</div><small>{label}</small><strong>{value}</strong><span>{note}</span></article>;
+}
