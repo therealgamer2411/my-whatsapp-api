@@ -76,6 +76,8 @@ export default function Home() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [apiKey, setApiKey] = useState("");
   const [health, setHealth] = useState(null);
+  const [serviceEnabled, setServiceEnabled] = useState(true);
+  const [serviceStarting, setServiceStarting] = useState(false);
   const [qr, setQr] = useState("");
   const [leads, setLeads] = useState([]);
   const [conversations, setConversations] = useState([]);
@@ -121,7 +123,7 @@ export default function Home() {
         cache: "no-store"
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || "تعذر تنفيذ الطلب (" + response.status + ").");
+      if (!response.ok && response.status !== 202) throw new Error(data.error || "تعذر تنفيذ الطلب (" + response.status + ").");
       return data;
     } finally {
       window.clearTimeout(timeout);
@@ -133,6 +135,8 @@ export default function Home() {
     try {
       const data = await request("/health", { method: "GET", auth: false });
       setHealth(data);
+      if (typeof data.whatsappServiceEnabled === "boolean") setServiceEnabled(data.whatsappServiceEnabled);
+      setServiceStarting(Boolean(data.whatsappInitializing));
       setLastSync(new Date());
       if (showNotice) announce("success", data.whatsapp === "ready" ? "اتصال واتساب يعمل." : "وصلنا إلى الخادم، لكن واتساب غير متصل بعد.");
       return data;
@@ -231,12 +235,42 @@ export default function Home() {
     }
     setBusy(true);
     try {
-      const data = await request("/admin/qr");
-      setQr(data.qr || "");
+      let data = null;
+      for (let attempt = 0; attempt < 7; attempt += 1) {
+        data = await request("/admin/qr");
+        if (data.qr || data.connected || !data.waiting) break;
+        if (attempt < 6) await new Promise((resolve) => window.setTimeout(resolve, 1800));
+      }
+      setQr(data?.qr || "");
       await checkHealth(false);
-      announce("success", data.connected ? "واتساب متصل بالفعل." : data.qr ? "رمز الربط جاهز للمسح." : "لم يظهر رمز QR بعد. شغّل محرك واتساب وانتظر ظهوره.");
+      announce("success", data?.connected ? "واتساب متصل بالفعل." : data?.qr ? "رمز الربط جاهز للمسح." : "المحرك يعمل، لكنه لم يصدر QR حتى الآن. راجع حالة التشغيل والسجل.");
     } catch (error) {
       announce("error", error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const controlWhatsApp = async (action) => {
+    if (!adminToken) {
+      announce("warning", "أدخل رمز الإدارة أولًا.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const data = await request("/admin/whatsapp/" + action, { method: "POST" });
+      setServiceEnabled(Boolean(data.enabled));
+      setServiceStarting(Boolean(data.starting));
+      if (action === "stop") {
+        setQr("");
+        setHealth((current) => current ? { ...current, whatsapp: "disconnected", whatsappServiceEnabled: false, whatsappInitializing: false } : current);
+        announce("success", "تم إيقاف اتصال واتساب. لوحة التحكم والخادم ما زالا يعملان.");
+      } else {
+        announce("success", "أرسلنا أمر تشغيل واتساب. انتظر بدء المتصفح ثم اطلب عرض QR.");
+        await checkHealth(false);
+      }
+    } catch (error) {
+      announce("error", error.message || "تعذر التحكم في خدمة واتساب.");
     } finally {
       setBusy(false);
     }
@@ -274,6 +308,7 @@ export default function Home() {
 
   const activePage = NAV.find((item) => item.id === page)?.label || "الرئيسية";
   const isConnected = health?.whatsapp === "ready";
+  const connectionLabel = isConnected ? "متصل" : serviceStarting ? "جارٍ التشغيل" : serviceEnabled ? "يعمل - بانتظار الربط" : "متوقف";
 
   return (
     <main className="app-shell">
@@ -287,7 +322,7 @@ export default function Home() {
         </div>
         <div className="top-actions">
           <span className={"status-pill " + (isConnected ? "online" : "offline")}>
-            <i />{isConnected ? "متصل" : "غير متصل"}
+            <i />{connectionLabel}
           </span>
           <button className="icon-button" title="تحديث" onClick={() => checkHealth(true)}>↻</button>
         </div>
@@ -372,7 +407,7 @@ export default function Home() {
           <div className="panel-card">
             <div className="panel-title">
               <div><span className="eyebrow">WHATSAPP LINK</span><h2>ربط رقمك الشخصي</h2></div>
-              <span className={"status-pill " + (isConnected ? "online" : "offline")}><i />{isConnected ? "متصل" : "غير متصل"}</span>
+              <span className={"status-pill " + (isConnected ? "online" : "offline")}><i />{connectionLabel}</span>
             </div>
             <p className="panel-description">اربط رقمك الحالي كجهاز مرتبط. ستظل تستخدم تطبيق واتساب على هاتفك كالمعتاد.</p>
             <Field label="رابط محرك واتساب" hint="عنوان HTTPS للخادم الذي يشغّل محرك WhatsApp Web، وليس رابط لوحة Vercel.">
@@ -382,8 +417,12 @@ export default function Home() {
               <input className="text-input" type="password" dir="ltr" autoComplete="off" placeholder="Bearer token" value={adminToken} onChange={(e) => setAdminToken(e.target.value)} />
             </Field>
             <div className="button-row">
-              <button className="primary-button" disabled={busy} onClick={() => checkHealth(true)}>{busy ? "جارٍ الفحص..." : "اختبار الاتصال"}</button>
-              <button className="secondary-button" disabled={busy} onClick={loadQr}>عرض QR</button>
+              <button className="primary-button" disabled={busy || serviceEnabled} onClick={() => controlWhatsApp("start")}>▶ تشغيل واتساب</button>
+              <button className="secondary-button" disabled={busy || !serviceEnabled} onClick={() => controlWhatsApp("stop")}>■ إيقاف واتساب</button>
+              <button className="secondary-button" disabled={busy} onClick={() => checkHealth(true)}>تحديث الحالة</button>
+            </div>
+            <div className="button-row">
+              <button className="secondary-button" disabled={busy || !serviceEnabled || isConnected} onClick={loadQr}>عرض / تحديث QR</button>
             </div>
             {health ? (
               <div className="health-box">
