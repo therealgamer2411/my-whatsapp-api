@@ -45,6 +45,10 @@ RUN npm install --omit=dev
 
 COPY . .
 
+RUN node scripts/patch-wwebjs.js \
+    && node --check node_modules/whatsapp-web.js/src/Client.js \
+    && node --check node_modules/whatsapp-web.js/src/util/Puppeteer.js
+
 RUN mkdir -p /app/persist /app/persist/data /app/persist/.wwebjs_auth \
     && chown -R node:node /app
 
