@@ -112,10 +112,15 @@ export default function Home() {
     const headers = { ...(options.headers || {}) };
     // HTTP headers are Latin-1 only. Encode the UTF-8 admin token before placing it in a header.
     if (options.auth !== false && adminToken) {
-      const bytes = new TextEncoder().encode(adminToken);
-      let binary = "";
-      for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-      headers.Authorization = "Bearer-UTF8 " + btoa(binary);
+      // Preserve the legacy Bearer format for ordinary ASCII tokens; encode Unicode safely.
+      if (/^[\\x00-\\x7F]*$/.test(adminToken)) {
+        headers.Authorization = "Bearer " + adminToken;
+      } else {
+        const bytes = new TextEncoder().encode(adminToken);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+        headers.Authorization = "Bearer-UTF8 " + btoa(binary);
+      }
     }
     if (options.body) headers["Content-Type"] = "application/json";
     const controller = new AbortController();
