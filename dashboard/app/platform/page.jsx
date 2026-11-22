@@ -441,7 +441,7 @@ export default function PlatformPage() {
                 <button className={"session-row " + (selectedSession === s.id ? "chosen" : "")} onClick={() => { setSelectedSession(s.id); setQr(""); }}>
                   <div className="whatsapp-icon">◉</div><div className="session-info"><b>{s.label}</b><small dir="ltr">{s.phone_number || s.engine || "بانتظار الربط"}</small></div><span className={"mini-status " + (["WORKING","CONNECTED"].includes(s.status) ? "ok" : "")}>{s.status}</span>
                 </button>
-                <button className="session-delete" disabled={busy} onClick={() => deleteSession(s)} title="حذف الحساب">حذف</button>
+                <button type="button" className="session-delete" disabled={busy} onClick={() => deleteSession(s)} title="إزالة حساب واتساب من مساحة العمل"><span aria-hidden="true">×</span> إزالة الحساب</button>
               </div>)}
             </div>
           </section>
