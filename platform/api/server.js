@@ -237,8 +237,13 @@ app.post('/v1/whatsapp/sessions',auth,roles(['owner','admin']),async (req,res)=>
   const webhook={url:String(process.env.PUBLIC_API_URL).replace(/\/+$/,'')+'/webhooks/waha',events:['message','session.status'],hmac:{key:process.env.WAHA_WEBHOOK_HMAC_KEY},customHeaders:[{name:'X-MF-Webhook-Secret',value:process.env.WAHA_WEBHOOK_HEADER_SECRET}],retries:{policy:'exponential',delaySeconds:2,attempts:8}};
   try {
     const remote=await waha('POST','/api/sessions',{name,config:{webhooks:[webhook],noweb:{store:{enabled:true,fullSync:false}}}});
+    // Explicitly start newly created or restored sessions that WAHA reports as STOPPED.
+    let started=remote;
+    if (String(remote?.status || '').toUpperCase()==='STOPPED' || !remote?.status) {
+      started=await waha('POST','/api/sessions/'+encodeURIComponent(name)+'/start',{});
+    }
     const r=await pool.query('INSERT INTO wa_sessions(id,workspace_id,waha_name,label,engine,status) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,label,phone_number,engine,status,created_at',
-      [sid,req.actor.workspaceId,name,label,String(process.env.WAHA_DEFAULT_ENGINE || 'NOWEB'),String(remote?.status || 'STARTING')]);
+      [sid,req.actor.workspaceId,name,label,String(process.env.WAHA_DEFAULT_ENGINE || 'NOWEB'),String(started?.status || 'STARTING')]);
     res.status(201).json({session:r.rows[0]});
   } catch(e) { console.error('[Create session]',e.message); res.status(502).json({error:'تعذر إنشاء جلسة واتساب: '+e.message}); }
 });
@@ -246,7 +251,12 @@ app.get('/v1/whatsapp/sessions/:id',auth,async (req,res)=>{
   const row=await getSession(req.actor.workspaceId,req.params.id);
   if (!row) return res.status(404).json({error:'الجلسة غير موجودة.'});
   try {
-    const remote=await waha('GET','/api/sessions/'+encodeURIComponent(row.waha_name));
+    let remote=await waha('GET','/api/sessions/'+encodeURIComponent(row.waha_name));
+    // Recover a stopped session during polling instead of leaving the UI stuck forever.
+    if (String(remote?.status || '').toUpperCase()==='STOPPED') {
+      await waha('POST','/api/sessions/'+encodeURIComponent(row.waha_name)+'/start',{});
+      remote=await waha('GET','/api/sessions/'+encodeURIComponent(row.waha_name));
+    }
     const status=String(remote?.status || row.status), phone=String(remote?.me?.id || '').split('@')[0].split(':')[0];
     await pool.query('UPDATE wa_sessions SET status=$1,phone_number=$2,updated_at=NOW() WHERE id=$3',[status,phone,row.id]);
     res.json({id:row.id,label:row.label,status,phoneNumber:phone,engine:remote?.engine?.engine || row.engine});
