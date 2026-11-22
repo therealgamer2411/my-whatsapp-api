@@ -28,6 +28,7 @@ let whatsappServiceEnabled = true;
 let whatsappInitializing = false;
 let whatsappLastError = null;
 let whatsappOperationId = 0;
+let whatsappInitPromise = null;
 const queues = new Map();
 const botOutbox = new Map();
 
@@ -333,29 +334,41 @@ function createWhatsAppClient() {
 let client = createWhatsAppClient();
 
 function startWhatsApp() {
-  if (whatsappServiceEnabled && (ready || whatsappInitializing)) return;
+  // Never call initialize() twice on the same whatsapp-web.js Client.
+  // A QR event does not mean initialize() has settled; it remains pending until auth/ready.
+  if (whatsappServiceEnabled && (ready || whatsappInitializing || whatsappInitPromise)) return;
+
   const operationId = ++whatsappOperationId;
   whatsappServiceEnabled = true;
   whatsappInitializing = true;
   whatsappLastError = null;
   latestQr = null;
-  console.log('[WhatsApp] Start requested from dashboard.');
+  console.log('[WhatsApp] Start requested; initialization lock acquired.');
+
   setTimeout(() => {
     if (!whatsappServiceEnabled || operationId !== whatsappOperationId) return;
+
     try {
       if (!client) client = createWhatsAppClient();
-      client.initialize().catch((error) => {
+      const activeClient = client;
+      const initPromise = Promise.resolve().then(() => activeClient.initialize());
+      whatsappInitPromise = initPromise;
+
+      initPromise.catch((error) => {
         if (operationId !== whatsappOperationId) return;
         ready = false;
         whatsappInitializing = false;
-        whatsappLastError = error.message || 'Initialization failed';
+        whatsappLastError = error && error.message ? error.message : String(error || 'Initialization failed');
         console.error('[WhatsApp] Initialization failed:', whatsappLastError);
-      }).then(() => {
-        if (operationId === whatsappOperationId && ready) whatsappInitializing = false;
+      }).finally(() => {
+        if (operationId !== whatsappOperationId) return;
+        if (whatsappInitPromise === initPromise) whatsappInitPromise = null;
+        if (ready || latestQr) whatsappInitializing = false;
       });
     } catch (error) {
+      if (operationId !== whatsappOperationId) return;
       whatsappInitializing = false;
-      whatsappLastError = error.message || 'Initialization failed';
+      whatsappLastError = error && error.message ? error.message : String(error || 'Initialization failed');
       console.error('[WhatsApp] Start failed:', whatsappLastError);
     }
   }, 250);
@@ -371,6 +384,7 @@ async function stopWhatsApp() {
   console.log('[WhatsApp] Stop requested from dashboard.');
   const oldClient = client;
   client = null;
+  whatsappInitPromise = null;
   try { if (oldClient) await oldClient.destroy(); }
   catch (error) { console.warn('[WhatsApp] Stop cleanup:', error.message); }
 }
@@ -656,15 +670,7 @@ app.listen(PORT, HOST, () => {
   const browserStartDelay = Math.max(10000, Number(process.env.WHATSAPP_START_DELAY_MS || 15000));
   console.log('[WhatsApp] Browser initialization scheduled in ' + browserStartDelay + 'ms.');
   setTimeout(() => {
-    if (!whatsappServiceEnabled) return;
-    whatsappInitializing = true;
-    whatsappLastError = null;
-    client.initialize().catch((error) => {
-      ready = false;
-      whatsappInitializing = false;
-      whatsappLastError = error.message || 'Initialization failed';
-      console.error('[WhatsApp] Initialization failed:', whatsappLastError);
-    }).then(() => { if (ready) whatsappInitializing = false; });
+    startWhatsApp();
   }, browserStartDelay);
 });
 
