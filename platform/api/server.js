@@ -140,32 +140,6 @@ app.get('/health',async (req,res)=>{
   catch { res.status(503).json({ok:false,database:'unavailable'}); }
 });
 
-app.get('/health/whatsapp',async (req,res)=>{
-  const started=Date.now();
-  try {
-    const version=await waha('GET','/api/server/version');
-    return res.json({ok:true,gateway:'reachable',version:version?.version || version?.data?.version || version,durationMs:Date.now()-started});
-  } catch (error) {
-    const cause=error.cause || {};
-    const target=(()=>{try{return new URL(process.env.WAHA_URL).host;}catch{return 'not-configured';}})();
-    console.error('[WAHA health]',error.message,cause.code || '',cause.message || '');
-    return res.status(503).json({ok:false,gateway:'unreachable',target,error:error.message,cause:{name:cause.name || '',code:cause.code || '',message:cause.message || ''},durationMs:Date.now()-started});
-  }
-});
-
-app.post('/health/whatsapp',async (req,res)=>{
-  const started=Date.now();
-  try {
-    const version=await waha('GET','/api/server/version');
-    return res.json({ok:true,gateway:'reachable',version:version?.version || version?.data?.version || version,durationMs:Date.now()-started});
-  } catch (error) {
-    const cause=error.cause || {};
-    const target=(()=>{try{return new URL(process.env.WAHA_URL).host;}catch{return 'not-configured';}})();
-    console.error('[WAHA health]',error.message,cause.code || '',cause.message || '');
-    return res.status(503).json({ok:false,gateway:'unreachable',target,error:error.message,cause:{name:cause.name || '',code:cause.code || '',message:cause.message || ''},durationMs:Date.now()-started});
-  }
-});
-
 /* Webhook route precedes express.json so signatures are checked against raw bytes. */
 app.post('/webhooks/waha',express.raw({type:'application/json',limit:'2mb'}),async (req,res)=>{
   const raw=Buffer.isBuffer(req.body)?req.body:Buffer.from('');
@@ -262,7 +236,7 @@ app.post('/v1/whatsapp/sessions',auth,roles(['owner','admin']),async (req,res)=>
   const sid=newId(), name='mf_'+sid.replace(/-/g,''), label=String(req.body.label || 'واتساب الشركة').trim().slice(0,80);
   const webhook={url:String(process.env.PUBLIC_API_URL).replace(/\/+$/,'')+'/webhooks/waha',events:['message','session.status'],hmac:{key:process.env.WAHA_WEBHOOK_HMAC_KEY},customHeaders:[{name:'X-MF-Webhook-Secret',value:process.env.WAHA_WEBHOOK_HEADER_SECRET}],retries:{policy:'exponential',delaySeconds:2,attempts:8}};
   try {
-    const remote=await waha('POST','/api/sessions',{name,config:{webhooks:[webhook]}});
+    const remote=await waha('POST','/api/sessions',{name,config:{webhooks:[webhook],noweb:{store:{enabled:true,fullSync:false}}}});
     const r=await pool.query('INSERT INTO wa_sessions(id,workspace_id,waha_name,label,engine,status) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,label,phone_number,engine,status,created_at',
       [sid,req.actor.workspaceId,name,label,String(process.env.WAHA_DEFAULT_ENGINE || 'NOWEB'),String(remote?.status || 'STARTING')]);
     res.status(201).json({session:r.rows[0]});
