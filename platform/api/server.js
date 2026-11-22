@@ -742,25 +742,48 @@ app.get('/v1/conversations/:id/messages',auth,async (req,res)=>{
   const c=await getContact(req.actor.workspaceId,req.params.id);
   if (!c) return res.status(404).json({error:'المحادثة غير موجودة.'});
   if (req.query.sync==='1') {
+    const pendingVoices=[];
     try {
-      const route='/api/'+encodeURIComponent(c.waha_name)+'/chats/'+encodeURIComponent(c.chat_id)+'/messages?limit=100&downloadMedia=false';
+      const route='/api/'+encodeURIComponent(c.waha_name)+'/chats/'+encodeURIComponent(c.chat_id)+'/messages?limit=100&downloadMedia=true&downloadMediaMimetypes=audio';
       const remote=await waha('GET',route), rows=Array.isArray(remote)?remote:(remote?.messages || remote?.data || []);
       const client=await pool.connect();
       try {
         await client.query('BEGIN');
         for (const msg of rows) {
-          const body=String(msg.body || msg.caption || (msg.hasMedia?'[مرفق]':'')).trim();
-          if (!body) continue;
+          const voice=isVoiceMessage(msg);
           const rawId=msg.id, wamid=typeof rawId==='string'?rawId:(rawId?._serialized || rawId?.id || 'sync-'+String(msg.timestamp || Date.now())+'-'+c.chat_id);
+          const body=voice&&!msg.fromMe?'🎤 رسالة صوتية (جارٍ تحويلها إلى نص...)':String(msg.body || msg.caption || (msg.hasMedia?'[مرفق]':'')).trim();
+          if (!body && !voice) continue;
           const timestamp=Number(msg.timestamp), sentAt=Number.isFinite(timestamp)&&timestamp>0?new Date(timestamp*1000):new Date();
-          await client.query(
-            "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(session_id,wamid) DO NOTHING",
-            [newId(),c.workspace_id,c.session_id,c.id,String(wamid),msg.fromMe?'outbound':'inbound',String(msg.type || (msg.hasMedia?'media':'text')),body,msg.fromMe?'sent':'received',sentAt]);
+          const mediaPath=wahaMediaPath(msg.media?.url || msg.mediaUrl || '');
+          const mime=String(msg.media?.mimetype || (voice?'audio/ogg':'')).toLowerCase().split(';')[0];
+          const messageType=voice?'ptt':String(msg.type || (msg.hasMedia?'media':'text'));
+          const saved=await client.query(
+            "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at,media_url,media_mimetype,transcription_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(session_id,wamid) DO NOTHING RETURNING id",
+            [newId(),c.workspace_id,c.session_id,c.id,String(wamid),msg.fromMe?'outbound':'inbound',messageType,body,msg.fromMe?'sent':'received',sentAt,mediaPath,mime,voice&&!msg.fromMe?'pending':'none']
+          );
+          let rowId=saved.rows[0]?.id;
+          if (!rowId && voice && !msg.fromMe) {
+            const existing=await client.query("SELECT id,transcription_status FROM messages WHERE session_id=$1 AND wamid=$2",[c.session_id,String(wamid)]);
+            rowId=existing.rows[0]?.id;
+            if (rowId && existing.rows[0].transcription_status!=='completed') {
+              await client.query("UPDATE messages SET media_url=CASE WHEN $1='' THEN media_url ELSE $1 END,media_mimetype=CASE WHEN $2='' THEN media_mimetype ELSE $2 END WHERE id=$3",[mediaPath,mime,rowId]);
+            } else {
+              rowId=null;
+            }
+          }
+          if (rowId && voice && !msg.fromMe) pendingVoices.push({id:rowId,payload:msg});
         }
         await client.query('UPDATE contacts SET last_message_at=COALESCE((SELECT MAX(sent_at) FROM messages WHERE contact_id=$1),last_message_at) WHERE id=$1',[c.id]);
         await client.query('COMMIT');
       } catch(e) { await client.query('ROLLBACK'); throw e; }
       finally { client.release(); }
+      if (pendingVoices.length) {
+        const session=await getSession(c.workspace_id,c.session_id);
+        if (session) for (const item of pendingVoices) {
+          setImmediate(()=>processIncomingVoice(session,c,item.id,item.payload).catch(e=>console.error('[Voice history worker]',e.message)));
+        }
+      }
     } catch(e) { console.error('[Message history sync]',e.message); }
   }
   const r=await pool.query("SELECT id,direction,message_type,body,status,sent_at,media_mimetype,transcription_status,(media_url<>'') AS has_media FROM messages WHERE contact_id=$1 ORDER BY sent_at ASC LIMIT 500",[c.id]);
