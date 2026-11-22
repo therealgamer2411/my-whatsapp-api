@@ -247,10 +247,10 @@ export default function Home() {
     setBusy(true);
     try {
       let data = null;
-      for (let attempt = 0; attempt < 7; attempt += 1) {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
         data = await request("/admin/qr");
         if (data.qr || data.connected || !data.waiting) break;
-        if (attempt < 6) await new Promise((resolve) => window.setTimeout(resolve, 1800));
+        if (attempt < 79) await new Promise((resolve) => window.setTimeout(resolve, 1500));
       }
       setQr(data?.qr || "");
       await checkHealth(false);
