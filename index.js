@@ -45,16 +45,17 @@ async function sendBotVoiceNote(chatId, oggBuffer) {
   return client.sendMessage(chatId, media, { sendAudioAsVoice: true, sendSeen: true });
 }
 
-async function sendAssistantReply(chatId, text, incomingWasVoice) {
+async function sendAssistantReply(chatId, text, incomingWasVoice, options = {}) {
   const mode = String(process.env.VOICE_REPLY_MODE || 'mirror').toLowerCase();
   const useVoice = mode === 'always' || (mode === 'mirror' && incomingWasVoice);
   if (useVoice) {
     try {
-      const audio = await synthesizeVoiceNote(text);
+      const spokenText = options.spokenText || text;
+      const audio = await synthesizeVoiceNote(spokenText);
       await sendBotVoiceNote(chatId, audio);
-      if (String(process.env.VOICE_REPLY_INCLUDE_TEXT || 'false').toLowerCase() === 'true') {
-        await sendBotMessage(chatId, text);
-      }
+      const includeText = options.includeText === true ||
+        String(process.env.VOICE_REPLY_INCLUDE_TEXT || 'false').toLowerCase() === 'true';
+      if (includeText) await sendBotMessage(chatId, text);
       return { mode: 'voice' };
     } catch (error) {
       console.error('[Voice] Generation or send failed; falling back to text:', error.message);
@@ -184,7 +185,10 @@ async function processMessage(message) {
     });
 
     const answer = handoffMessage(MANAGER_NAME, MANAGER_ROLE, managerPhone);
-    await sendAssistantReply(chatId, answer, incomingWasVoice);
+    await sendAssistantReply(chatId, answer, incomingWasVoice, {
+      includeText: true,
+      spokenText: 'تمام يا فندم، يسعدنا اهتمام حضرتك. هحوّل حضرتك للمستشار أحمد لمتابعة المعاينة أو استكمال الشراء. هتلاقي رقم التواصل المباشر ورابط الواتساب في الرسالة المكتوبة.'
+    });
     addMessage(chatId, 'assistant', answer);
 
     if (managerPhone) {
