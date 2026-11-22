@@ -1,0 +1,12 @@
+.git
+.github
+node_modules
+.env
+.env.*
+!.env.example
+data
+.wwebjs_auth
+persist
+*.log
+dashboard
+README.md
