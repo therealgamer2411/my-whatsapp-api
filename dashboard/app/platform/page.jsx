@@ -38,6 +38,9 @@ export default function PlatformPage() {
   const [campaignBody, setCampaignBody] = useState("");
   const [campaignDelay, setCampaignDelay] = useState(10000);
   const [campaignConfirmed, setCampaignConfirmed] = useState(false);
+  const [importPhones, setImportPhones] = useState("");
+  const [importSessionId, setImportSessionId] = useState("");
+  const [consentSource, setConsentSource] = useState("نموذج موافقة موثق من العميل");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -241,6 +244,23 @@ export default function PlatformPage() {
     } catch (e) { flash(e.message, true); }
   }
 
+  async function importContacts(event) {
+    event.preventDefault();
+    const phones = importPhones.split(/[\\s,;]+/).map(x => x.trim()).filter(Boolean);
+    if (!phones.length) { flash("أدخل أرقام الهواتف أولًا.", true); return; }
+    if (!window.confirm("هل تؤكد أن كل رقم في القائمة وافق صراحةً على استقبال رسائل تسويقية؟")) return;
+    setBusy(true);
+    try {
+      const result = await request("/v1/contacts/import", { method: "POST", body: JSON.stringify({
+        phones, sessionId: importSessionId, consentSource, confirmOptIn: true
+      })});
+      setImportPhones("");
+      await loadOverview();
+      flash("تم استيراد " + result.imported + " رقم. أرقام غير صالحة: " + result.invalid);
+    } catch (e) { flash(e.message, true); }
+    finally { setBusy(false); }
+  }
+
   async function createCampaign(event) {
     event.preventDefault();
     const selected = conversations.filter(c => c.marketing_opt_in && ["WORKING","CONNECTED"].includes(String(c.session_status).toUpperCase())).map(c => c.id);
@@ -249,7 +269,7 @@ export default function PlatformPage() {
     try {
       await request("/v1/campaigns", { method: "POST", body: JSON.stringify({
         title: campaignTitle, body: campaignBody, delayMs: Number(campaignDelay),
-        contactIds: selected, confirmOptIn: campaignConfirmed
+        allOptedIn: true, confirmOptIn: campaignConfirmed
       })});
       setCampaignTitle(""); setCampaignBody(""); setCampaignConfirmed(false);
       const data = await request("/v1/campaigns"); setCampaigns(data.campaigns || []);
@@ -447,7 +467,7 @@ export default function PlatformPage() {
               <label>نص الرسالة<textarea required rows={4} maxLength={4000} value={campaignBody} onChange={e=>setCampaignBody(e.target.value)} placeholder="اكتب الرسالة الموحدة هنا"/></label>
               <label>الفاصل التشغيلي بين الرسائل<select value={campaignDelay} onChange={e=>setCampaignDelay(Number(e.target.value))}><option value={10000}>10 ثوانٍ</option><option value={15000}>15 ثانية</option><option value={30000}>30 ثانية</option><option value={60000}>60 ثانية</option></select></label>
               <label className="consent-confirm"><input type="checkbox" checked={campaignConfirmed} onChange={e=>setCampaignConfirmed(e.target.checked)}/> أؤكد أن كل المستلمين وافقوا صراحةً على استقبال رسائل من هذا النشاط، وأن الرسالة متوافقة مع تفضيلاتهم.</label>
-              <button className="mf-primary" disabled={busy || !campaignConfirmed}>إنشاء الحملة وإرسالها إلى {conversations.filter(c => c.marketing_opt_in && ["WORKING","CONNECTED"].includes(String(c.session_status).toUpperCase())).length} جهة مؤهلة</button>
+              <button className="mf-primary" disabled={busy || !campaignConfirmed}>إنشاء الحملة وإرسالها إلى جميع جهات الاتصال صاحبة الموافقة</button>
             </form>
           </section>
           <section className="panel campaign-panel">
