@@ -34,7 +34,7 @@
    - `ADMIN_TOKEN`: مفتاح عشوائي طويل. للتوليد:
      `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
    - `GEMINI_API_KEY`: مفتاح من Google AI Studio.
-   - `GEMINI_AUDIO_MODEL`: نموذج فهم وتفريغ الصوت، الافتراضي `gemini-3.6-flash`.
+   - `GEMINI_AUDIO_MODEL`: نموذج فهم وتفريغ الصوت، الافتراضي `gemini-3.5-transcribe`.
    - `GEMINI_TTS_MODEL`: نموذج توليد الصوت، الافتراضي `gemini-3.8-flash-tts`.
    - `VOICE_REPLY_MODE=mirror`: يرد برسالة صوتية عندما يرسل العميل رسالة صوتية، ويرد نصيًا على الرسائل النصية. اختر `always` للصوت دائمًا أو `never` للنص فقط.
    - `VOICE_REPLY_INCLUDE_TEXT=true`: لإرسال النص بجانب الرسالة الصوتية إذا رغبت.
