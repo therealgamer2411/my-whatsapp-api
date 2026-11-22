@@ -97,7 +97,7 @@ async function aiCompletion(settings,history) {
   const messages=[{role:'system',content:settings.system_prompt}];
   for (const row of history) messages.push({role:row.direction==='inbound'?'user':'assistant',content:row.body});
   if (settings.provider==='gemini') {
-    const key=decrypt(settings.api_key_ciphertext), model=settings.model || 'gemini-2.5-flash';
+    const key=decrypt(settings.api_key_ciphertext);\n    const configuredModel=String(settings.model || 'gemini-3.8-flash').replace(/^models\\//,'');\n    const model=['gemini-2.5-flash','gemini-2.5-flash-latest'].includes(configuredModel)?'gemini-3.8-flash':configuredModel;
     if (!key) throw new Error('Missing Gemini API key.');
     const contents=messages.filter(m=>m.role!=='system').map(m=>({role:m.role==='assistant'?'model':'user',parts:[{text:m.content}]}));
     const response=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{
@@ -534,7 +534,7 @@ app.use((err,req,res,next)=>{
 async function start() {
   const needed=['DATABASE_URL','JWT_SECRET','SECRET_ENCRYPTION_KEY'];
   for (const key of needed) if (!process.env[key]) throw new Error(key+' is required.');
-  await pool.query(fs.readFileSync(path.join(__dirname,'schema.sql'),'utf8'));
+  await pool.query(fs.readFileSync(path.join(__dirname,'schema.sql'),'utf8'));\n  await pool.query(\"UPDATE assistant_settings SET model='gemini-3.8-flash',updated_at=NOW() WHERE provider='gemini' AND model IN ('gemini-2.5-flash','models/gemini-2.5-flash')\");
   // Recover queued work after a process restart; campaign state is durable in PostgreSQL.
   await pool.query("UPDATE campaigns SET status='queued',updated_at=NOW() WHERE status='running'");
   const pending=(await pool.query("SELECT id,workspace_id FROM campaigns WHERE status='queued' ORDER BY created_at")).rows;
