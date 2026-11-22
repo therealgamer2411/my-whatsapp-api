@@ -124,14 +124,19 @@ function patchClient() {
     'Debug readiness polling option'
   );
 
-  source = replaceExactlyOnce(
-    source,
-    `                { timeout: authTimeout },
-            );`,
-    `                { timeout: authTimeout, polling: 200 },
-            );`,
-    'WhatsApp socket readiness polling option'
-  );
+  // Use interval polling for the WhatsApp socket readiness check.
+  // Puppeteer's default requestAnimationFrame polling can stall in headless cloud Chromium.
+  const socketWaitPattern = /(const needAuthHandle = await this\.pupPage\.waitForFunction\([\s\S]*?\{\s*timeout:\s*authTimeout)(\s*\})/;
+  if (!socketWaitPattern.test(source)) {
+    throw new Error('[wwebjs-patch] Could not locate WhatsApp socket readiness wait.');
+  }
+  source = source.replace(socketWaitPattern, (match, prefix, suffix) => {
+    if (/polling\s*:\s*200/.test(match)) return match;
+    return prefix + ', polling: 200' + suffix;
+  });
+  if (!/const needAuthHandle[\s\S]*?polling:\s*200/.test(source)) {
+    throw new Error('[wwebjs-patch] WhatsApp socket readiness polling was not applied.');
+  }
 
   source = replaceExactlyOnce(
     source,
