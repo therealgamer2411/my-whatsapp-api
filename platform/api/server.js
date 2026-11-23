@@ -511,7 +511,8 @@ async function assistantReply(session,contact) {
         file:{mimetype:audio.mimeType,filename:'media-first-reply.wav',data:audio.base64},
         convert:true
       },90000);
-      const wamid=String(sent?.id || sent?.key?.id || 'assistant-voice-'+newId());
+      const sentId=typeof sent?.id==='string'?sent.id:(sent?.id?._serialized || sent?.id?.id || sent?.key?.id || '');
+      const wamid=String(sentId || 'assistant-voice-'+newId());
       const mediaPath=wahaMediaPath(sent?.media?.url || sent?.mediaUrl || '');
       await pool.query(
         "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at,media_url,media_mimetype,transcription_status) VALUES($1,$2,$3,$4,$5,'outbound','ptt',$6,'sent',NOW(),$7,'audio/ogg','none') ON CONFLICT(session_id,wamid) DO NOTHING",
