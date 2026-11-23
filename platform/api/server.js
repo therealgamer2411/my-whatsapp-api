@@ -423,56 +423,57 @@ async function generateAssistantVoice(settings,text) {
   const key=decrypt(settings.api_key_ciphertext || '');
   if (!key) throw new Error('Gemini API key is missing for voice generation.');
   const spoken=String(text || '')
-    .replace(/[\u200B-\u200D\uFEFF]/g,'')
-    .replace(/[*_~`#]/g,'')
-    .replace(/\\\\/g,'')
+    .replace(/[\\u200B-\\u200D\\uFEFF]/g,'')
+    .replace(/[*_~\x60#]/g,'')
     .trim()
     .slice(0,5000);
   if (!spoken) throw new Error('Assistant response is empty; cannot synthesize voice.');
-  const api='https://generativelanguage.googleapis.com/v1beta';
+  const api='https://generativelanguage.googleapis.com/v1beta/interactions';
   const preferred=String(process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-lite-tts').trim();
   const models=[...new Set([preferred,'gemini-3.8-flash-lite-tts','gemini-3.8-flash-tts'])];
   const voiceName=String(process.env.GEMINI_TTS_VOICE || 'Kore').trim();
   const failures=[];
   for (const model of models) {
     try {
-      const response=await fetch(api+'/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{
+      const response=await fetch(api,{
         method:'POST',
-        headers:{'Content-Type':'application/json'},
+        headers:{'Content-Type':'application/json','x-goog-api-key':key},
         body:JSON.stringify({
-          contents:[{role:'user',parts:[{
+          model,
+          input:[{type:'user_input',content:[{
+            type:'text',
             text:spoken,
-            speechMetadata:{style:'Speak naturally in a warm, clear Egyptian Arabic dialect (Masri), like a helpful and confident customer-service representative. Keep a moderate pace and pronounce Arabic names clearly.'}
+            annotations:[{
+              type:'speech_metadata',
+              style:'Speak naturally in a warm, clear Egyptian Arabic dialect (Masri), like a helpful and confident customer-service representative. Keep a moderate pace and pronounce Arabic names clearly.'
+            }]
           }]}],
-          generationConfig:{
-            responseModalities:['AUDIO'],
-            speechConfig:{
-              languageCode:'ar-XA',
-              voiceConfig:{prebuiltVoiceConfig:{voiceName}}
-            }
-          }
+          response_format:{type:'audio'},
+          generation_config:{speech_config:[{voice:voiceName}]}
         }),
         signal:AbortSignal.timeout(90000)
       });
       const data=await response.json().catch(()=>({}));
       if (!response.ok) {
-        const reason=String(data.error?.message || 'Gemini TTS HTTP '+response.status);
+        const reason=String(data.error?.message || data.message || 'Gemini TTS HTTP '+response.status);
         failures.push(model+': '+reason);
         console.warn('[Gemini TTS model failed]',model,reason);
         if ([401,403].includes(response.status) && /API_KEY_INVALID|API key not valid|permission|leaked/i.test(reason)) break;
         continue;
       }
-      const part=(data.candidates?.[0]?.content?.parts || []).find(p=>p.inlineData?.data);
-      const base64=String(part?.inlineData?.data || '');
+      const audioPart=(data.steps || [])
+        .filter(step=>step.type==='model_output')
+        .flatMap(step=>step.content || [])
+        .filter(part=>part.type==='audio' && part.data)
+        .slice(-1)[0];
+      const base64=String(audioPart?.data || data.output_audio?.data || '');
       if (!base64) {
         failures.push(model+': no audio data in Gemini response');
         continue;
       }
       const bytes=Buffer.from(base64,'base64');
       if (!bytes.length || bytes.length>18*1024*1024) throw new Error('Generated audio is empty or larger than 18 MB.');
-      const mimeType=String(part?.inlineData?.mimeType || 'audio/wav');
-      if (!mimeType.startsWith('audio/')) throw new Error('Gemini returned a non-audio payload.');
-      return {base64,mimeType,bytes:bytes.length};
+      return {base64,mimeType:'audio/wav',bytes:bytes.length};
     } catch(e) {
       failures.push(model+': '+e.message);
       console.warn('[Gemini TTS model failed]',model,e.message);
