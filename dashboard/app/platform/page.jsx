@@ -615,7 +615,7 @@ export default function PlatformPage() {
                   String(m.message_type || "").toLowerCase() === "audio" ||
                   String(m.media_mimetype || "").toLowerCase().startsWith("audio/");
                 return <div key={m.id} className={"chat-bubble " + (m.direction === "outbound" ? "out" : "in") + (isVoice ? " voice-bubble" : "")}>
-                  {isVoice && <div className="voice-message-title">🎤 رسالة صوتية</div>}
+                  {isVoice && <div className="voice-message-title">{m.direction === "outbound" ? "🎙️ رد صوتي من السكرتير" : "🎤 رسالة صوتية من العميل"}</div>}
                   {isVoice && audioUrls[m.id] && <audio className="voice-audio-player" controls preload="none" src={audioUrls[m.id]} />}
                   <p>{m.body}</p>
                   {isVoice && m.transcription_status === "pending" && <small className="voice-status">جارٍ تحويل الصوت إلى نص...</small>}
