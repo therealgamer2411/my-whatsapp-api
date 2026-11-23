@@ -423,7 +423,7 @@ async function generateAssistantVoice(settings,text) {
   const key=decrypt(settings.api_key_ciphertext || '');
   if (!key) throw new Error('Gemini API key is missing for voice generation.');
   const spoken=String(text || '')
-    .replace(/[\\u200B-\\u200D\\uFEFF]/g,'')
+    .replace(/[\u200B-\u200D\uFEFF]/g,'')
     .replace(/[*_~\x60#]/g,'')
     .trim()
     .slice(0,5000);
