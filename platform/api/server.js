@@ -64,10 +64,10 @@ function auth(req,res,next) {
 const roles = allowed => (req,res,next) => allowed.includes(req.actor.role) ? next() : res.status(403).json({error:'ليس لديك صلاحية لهذا الإجراء.'});
 const rate = rateLimit({windowMs:900000,limit:30,standardHeaders:'draft-8',legacyHeaders:false});
 function wahaHeaders(extra) { return Object.assign({'X-Api-Key':process.env.WAHA_API_KEY,'Content-Type':'application/json'},extra || {}); }
-async function waha(method,route,body) {
+async function waha(method,route,body,timeoutMs=25000) {
   const base=String(process.env.WAHA_URL || '').replace(/\/+$/,'');
   if (!base) throw new Error('WhatsApp gateway is not configured.');
-  const response=await fetch(base+route,{method,headers:wahaHeaders(),body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(25000)});
+  const response=await fetch(base+route,{method,headers:wahaHeaders(),body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(timeoutMs)});
   const raw=await response.text(); let result=null;
   try { result=raw?JSON.parse(raw):null; } catch { result=raw; }
   if (!response.ok) throw new Error(String(result?.message || result?.error || 'WAHA HTTP '+response.status).slice(0,300));
@@ -419,6 +419,68 @@ async function processIncomingVoice(session,contact,messageRowId,payload) {
     await sendVoiceFailureReply(session,contact);
   }
 }
+async function generateAssistantVoice(settings,text) {
+  const key=decrypt(settings.api_key_ciphertext || '');
+  if (!key) throw new Error('Gemini API key is missing for voice generation.');
+  const spoken=String(text || '')
+    .replace(/[\u200B-\u200D\uFEFF]/g,'')
+    .replace(/[*_~`#]/g,'')
+    .replace(/\\\\/g,'')
+    .trim()
+    .slice(0,5000);
+  if (!spoken) throw new Error('Assistant response is empty; cannot synthesize voice.');
+  const api='https://generativelanguage.googleapis.com/v1beta';
+  const preferred=String(process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-lite-tts').trim();
+  const models=[...new Set([preferred,'gemini-3.8-flash-lite-tts','gemini-3.8-flash-tts'])];
+  const voiceName=String(process.env.GEMINI_TTS_VOICE || 'Kore').trim();
+  const failures=[];
+  for (const model of models) {
+    try {
+      const response=await fetch(api+'/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          contents:[{role:'user',parts:[{
+            text:spoken,
+            speechMetadata:{style:'Speak naturally in a warm, clear Egyptian Arabic dialect (Masri), like a helpful and confident customer-service representative. Keep a moderate pace and pronounce Arabic names clearly.'}
+          }]}],
+          generationConfig:{
+            responseModalities:['AUDIO'],
+            speechConfig:{
+              languageCode:'ar-XA',
+              voiceConfig:{prebuiltVoiceConfig:{voiceName}}
+            }
+          }
+        }),
+        signal:AbortSignal.timeout(90000)
+      });
+      const data=await response.json().catch(()=>({}));
+      if (!response.ok) {
+        const reason=String(data.error?.message || 'Gemini TTS HTTP '+response.status);
+        failures.push(model+': '+reason);
+        console.warn('[Gemini TTS model failed]',model,reason);
+        if ([401,403].includes(response.status) && /API_KEY_INVALID|API key not valid|permission|leaked/i.test(reason)) break;
+        continue;
+      }
+      const part=(data.candidates?.[0]?.content?.parts || []).find(p=>p.inlineData?.data);
+      const base64=String(part?.inlineData?.data || '');
+      if (!base64) {
+        failures.push(model+': no audio data in Gemini response');
+        continue;
+      }
+      const bytes=Buffer.from(base64,'base64');
+      if (!bytes.length || bytes.length>18*1024*1024) throw new Error('Generated audio is empty or larger than 18 MB.');
+      const mimeType=String(part?.inlineData?.mimeType || 'audio/wav');
+      if (!mimeType.startsWith('audio/')) throw new Error('Gemini returned a non-audio payload.');
+      return {base64,mimeType,bytes:bytes.length};
+    } catch(e) {
+      failures.push(model+': '+e.message);
+      console.warn('[Gemini TTS model failed]',model,e.message);
+    }
+  }
+  throw new Error('Gemini voice generation failed: '+failures.slice(0,5).join(' | ').slice(0,1000));
+}
+
 async function assistantReply(session,contact) {
   const sr=await pool.query('SELECT * FROM assistant_settings WHERE workspace_id=$1',[session.workspace_id]), settings=sr.rows[0];
   if (!settings || !settings.enabled || contact.is_paused) return;
@@ -430,12 +492,9 @@ async function assistantReply(session,contact) {
     const secretary=route.secretary;
     const lastInboundMessage=[...history].reverse().find(message=>message.direction==='inbound');
     const isReplyingToVoice=String(lastInboundMessage?.body || '').startsWith('🎤 رسالة صوتية:');
-    const voiceReplyInstruction=isReplyingToVoice
-      ? 'تعليم إلزامي لهذه الرسالة: أرسل إجابتك كتابةً كنص واتساب عادي فقط. لا تنشئ رسالة صوتية ولا تطلب تحويل الرد إلى صوت ولا تضع تعليمات أو علامات توحي بإرفاق تسجيل صوتي.'
-      : '';
     const effectiveSettings={
       ...settings,
-      system_prompt:[settings.system_prompt,secretary.system_prompt,voiceReplyInstruction].filter(Boolean).join('\n\n')
+      system_prompt:[settings.system_prompt,secretary.system_prompt].filter(Boolean).join('\n\n')
     };
     console.log('[Secretary routed]',{
       contactId:contact.id,secretaryId:secretary.id,secretaryName:secretary.name,
@@ -443,6 +502,23 @@ async function assistantReply(session,contact) {
     });
     const answer=await aiCompletion(effectiveSettings,history);
     if (!answer) return;
+    if (isReplyingToVoice) {
+      const audio=await generateAssistantVoice(settings,answer);
+      const sent=await waha('POST','/api/sendVoice',{
+        session:session.waha_name,
+        chatId:contact.chat_id,
+        file:{mimetype:audio.mimeType,filename:'media-first-reply.wav',data:audio.base64},
+        convert:true
+      },90000);
+      const wamid=String(sent?.id || sent?.key?.id || 'assistant-voice-'+newId());
+      const mediaPath=wahaMediaPath(sent?.media?.url || sent?.mediaUrl || '');
+      await pool.query(
+        "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status,sent_at,media_url,media_mimetype,transcription_status) VALUES($1,$2,$3,$4,$5,'outbound','ptt',$6,'sent',NOW(),$7,'audio/ogg','none') ON CONFLICT(session_id,wamid) DO NOTHING",
+        [newId(),session.workspace_id,session.id,contact.id,wamid,answer,mediaPath]
+      );
+      console.log('[Voice reply sent]',{contactId:contact.id,messageId:wamid,audioBytes:audio.bytes});
+      return;
+    }
     const sent=await waha('POST','/api/sendText',{session:session.waha_name,chatId:contact.chat_id,text:whatsappText(answer)});
     await pool.query(
       "INSERT INTO messages(id,workspace_id,session_id,contact_id,wamid,direction,message_type,body,status) VALUES($1,$2,$3,$4,$5,'outbound','text',$6,'sent') ON CONFLICT(session_id,wamid) DO NOTHING",
@@ -791,20 +867,27 @@ app.get('/v1/conversations/:id/messages',auth,async (req,res)=>{
       }
     } catch(e) { console.error('[Message history sync]',e.message); }
   }
-  const r=await pool.query("SELECT id,direction,message_type,body,status,sent_at,media_mimetype,transcription_status,(media_url<>'') AS has_media FROM messages WHERE contact_id=$1 ORDER BY sent_at ASC LIMIT 500",[c.id]);
+  const r=await pool.query("SELECT id,direction,message_type,body,status,sent_at,media_mimetype,transcription_status,(media_url<>'' OR message_type IN ('ptt','audio')) AS has_media FROM messages WHERE contact_id=$1 ORDER BY sent_at ASC LIMIT 500",[c.id]);
   res.json({contact:{id:c.id,name:c.display_name,phoneNumber:c.phone_number,isPaused:c.is_paused},messages:r.rows});
 });
 app.get('/v1/conversations/:id/messages/:messageId/media',auth,async(req,res)=>{
   const contact=await getContact(req.actor.workspaceId,req.params.id);
   if(!contact)return res.status(404).json({error:'المحادثة غير موجودة.'});
   const row=(await pool.query(
-    "SELECT media_url,media_mimetype FROM messages WHERE id=$1 AND contact_id=$2 AND workspace_id=$3",
+    "SELECT wamid,message_type,media_url,media_mimetype FROM messages WHERE id=$1 AND contact_id=$2 AND workspace_id=$3",
     [req.params.messageId,contact.id,req.actor.workspaceId]
   )).rows[0];
-  if(!row?.media_url)return res.status(404).json({error:'ملف الصوت غير متاح.'});
-  const mediaPath=wahaMediaPath(row.media_url);
-  if(!mediaPath)return res.status(404).json({error:'مسار الملف غير صالح.'});
+  if(!row)return res.status(404).json({error:'الرسالة غير موجودة.'});
+  let mediaPath=wahaMediaPath(row.media_url);
   try {
+    if(!mediaPath && ['ptt','audio'].includes(String(row.message_type||'').toLowerCase())) {
+      const route='/api/'+encodeURIComponent(contact.waha_name)+'/chats/'+encodeURIComponent(contact.chat_id)+'/messages/'+encodeURIComponent(row.wamid)+'?downloadMedia=true&downloadMediaMimetypes=audio';
+      const hydrated=await waha('GET',route);
+      mediaPath=wahaMediaPath(hydrated?.media?.url || hydrated?.mediaUrl || '');
+      const mime=String(hydrated?.media?.mimetype || row.media_mimetype || 'audio/ogg').toLowerCase().split(';')[0];
+      if(mediaPath) await pool.query("UPDATE messages SET media_url=$1,media_mimetype=$2 WHERE id=$3",[mediaPath,mime,req.params.messageId]);
+    }
+    if(!mediaPath)return res.status(404).json({error:'ملف الصوت غير متاح.'});
     const base=String(process.env.WAHA_URL||'').replace(/\/+$/,'');
     const remote=await fetch(base+mediaPath,{headers:{'X-Api-Key':process.env.WAHA_API_KEY},signal:AbortSignal.timeout(60000)});
     if(!remote.ok)return res.status(remote.status).json({error:'تعذر تحميل الملف الصوتي.'});
